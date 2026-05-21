@@ -1,0 +1,7 @@
+venv/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+vector_db.pkl
+file_hashes.json
