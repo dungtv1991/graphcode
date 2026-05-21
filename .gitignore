@@ -1,0 +1,15 @@
+venv/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+vector_db.pkl
+file_hashes.json
+.claude/
+.claude/
+sso.html
+sso.html.zip
+knowledge_graph.json
+dart_lang.so
+query_log.jsonl
+node_modules/
