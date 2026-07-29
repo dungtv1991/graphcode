@@ -176,7 +176,6 @@ python3 -c "from mcp_server import build_db; print(build_db())"
 | `EMBEDDING_MODEL` | Tên SentenceTransformer model | `paraphrase-multilingual-MiniLM-L12-v2` |
 | `OPENAI_API_KEY` | Dùng OpenAI embeddings thay local | — |
 | `AZURE_OPENAI_ENDPOINT` | Dùng Azure OpenAI embeddings | — |
-
 **Ưu tiên embedding**: Azure > OpenAI > Local (SentenceTransformer)
 
 ---

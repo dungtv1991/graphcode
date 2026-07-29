@@ -13,3 +13,5 @@ knowledge_graph.json
 dart_lang.so
 query_log.jsonl
 node_modules/
+.backup/
+bm25_index.pkl
