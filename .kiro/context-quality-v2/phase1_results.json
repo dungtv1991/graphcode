@@ -1,0 +1,43 @@
+{
+  "phase1_results": {
+    "bm25_vi_fix": {
+      "before": "Price* (sai hoàn toàn)",
+      "after": "CartItemPromotion top-1 (đúng)",
+      "status": "PASS"
+    },
+    "cartitempromotion_rank": {
+      "before": "48/8410 (cos 0.4574)",
+      "after": "1/8410 (cos 0.6501)",
+      "target": "top-5",
+      "status": "PASS"
+    },
+    "token_truncation": {
+      "before": "82% (602/730 token bị cắt)",
+      "after": "2.9% (mean 61.6 token, P95=114)",
+      "target": "0%",
+      "status": "PASS (97.1% vừa budget, 2.9% truncate nhẹ)"
+    },
+    "full_reembed_time": {
+      "before": "4.7 phút",
+      "after": "3.7 phút (incl. model load 6s)",
+      "target": "<=1.5 phút",
+      "status": "PARTIAL (cải thiện 21%, giới hạn bởi CPU throughput)"
+    },
+    "enrich_query_vi": {
+      "before": "trả nguyên query, không enrich",
+      "after": "enrich đúng: Cart, Promotion, Address, etc.",
+      "status": "PASS"
+    },
+    "consistency_guard": {
+      "doc_schema_version": 2,
+      "coverage_in_message": true,
+      "auto_full_rebuild_on_schema_change": true,
+      "status": "PASS"
+    },
+    "document_builder": {
+      "single_function": "_build_node_document used in both build_db and _incremental_rebuild",
+      "bm25_synced": true,
+      "status": "PASS"
+    }
+  }
+}

@@ -15,6 +15,19 @@ def _hash_file(path: str) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def _make_qualified_id(relative_path: str, class_name: str) -> str:
+    """Tạo qualified node ID: '{rel_path}::{ClassName}'.
+
+    Ví dụ: 'khlc-cart/lib/src/features/cart/bloc/cart_bloc.dart::CartBloc'
+    """
+    return f"{relative_path}::{class_name}"
+
+
+def _repo_from_path(rel_path: str) -> str:
+    """Derive repo name từ segment đầu của relative path."""
+    return rel_path.split("/")[0] if "/" in rel_path else rel_path
+
+
 # ─── Tree-sitter setup ───────────────────────────────────────────────────────
 try:
     from tree_sitter import Language, Parser as TSParser
@@ -154,7 +167,7 @@ def _resolve_import_to_class(pkg: str, path: str, package_repo_map: dict, file_m
     if not repo_name:
         return None
 
-    # Strategy 1: Exact path match
+    # Strategy 1: Exact path match — tìm node có path khớp import
     expected_suffix = os.path.join(repo_name, 'lib', path)
     for node_id, path_info in file_mapping.items():
         rel = path_info["path"] if isinstance(path_info, dict) else path_info
@@ -170,8 +183,11 @@ def _resolve_import_to_class(pkg: str, path: str, package_repo_map: dict, file_m
         # Check if this class exists in the target repo
         for node_id, path_info in file_mapping.items():
             rel = path_info["path"] if isinstance(path_info, dict) else path_info
-            if rel.startswith(repo_name + '/') and node_id == pascal:
-                return node_id
+            if rel.startswith(repo_name + '/'):
+                # Qualified ID ends with ::ClassName
+                bare = node_id.rsplit("::", 1)[-1] if "::" in node_id else node_id
+                if bare == pascal:
+                    return node_id
 
     return None
 
@@ -263,16 +279,18 @@ def parse_dart_file_ts(file_path: str, repo_name: str, root_dir: str):
         all_classes = event_classes + state_classes
         if all_classes:
             node_id = filename.replace('.dart', '').replace('_', ' ').title().replace(' ', '')
+            qualified_id = _make_qualified_id(relative_path, node_id)
             node_type = 'Event' if filename.endswith('_event.dart') else 'State'
             nodes_out.append({
-                "id": node_id, "type": node_type, "repo": repo_name,
+                "id": qualified_id, "type": node_type,
+                "bare_name": node_id,
                 "classes": all_classes[:20],
                 "methods": [], "events": [], "api_paths": [],
                 "route_paths": [], "error_types": [],
             })
-            file_mapping_out[node_id] = relative_path
+            file_mapping_out[qualified_id] = {"path": relative_path, "line": 1}
             bloc_name = node_id.replace('Event', 'Bloc').replace('State', 'Bloc')
-            edges_out.append({"from": bloc_name, "to": node_id, "type": "has_part"})
+            edges_out.append({"from": qualified_id, "to": bloc_name, "type": "has_part_of"})
         return nodes_out, edges_out, file_mapping_out
 
     # ── Tree-sitter parse ────────────────────────────────────────────────────
@@ -320,9 +338,9 @@ def parse_dart_file_ts(file_path: str, repo_name: str, root_dir: str):
         start_line = decl.start_point[0] + 1  # tree-sitter là 0-indexed
 
         nodes_out.append({
-            "id": class_name,
+            "id": _make_qualified_id(relative_path, class_name),
             "type": node_type,
-            "repo": repo_name,
+            "bare_name": class_name,
             "methods": methods,
             "events": events,
             "api_paths": api_paths,
@@ -333,19 +351,20 @@ def parse_dart_file_ts(file_path: str, repo_name: str, root_dir: str):
             "summary": _build_summary(class_name, node_type, base_class,
                                       methods, events, api_paths),
         })
-        file_mapping_out[class_name] = {"path": relative_path, "line": start_line}
-        current_classes.append(class_name)
+        qualified_id = _make_qualified_id(relative_path, class_name)
+        file_mapping_out[qualified_id] = {"path": relative_path, "line": start_line}
+        current_classes.append((class_name, qualified_id))
 
         # implements edges
         if decl.type == 'class_definition':
             for iface in _ts_get_implements(decl):
                 if iface != class_name:
-                    edges_out.append({"from": class_name, "to": iface, "type": "implements"})
+                    edges_out.append({"from": qualified_id, "to": iface, "type": "implements"})
 
         # ── Fix 1: extends edge ──
         if base_class and base_class not in ('', 'Mixin', 'Object', 'StatelessWidget',
                                               'StatefulWidget', 'State', 'Equatable'):
-            edges_out.append({"from": class_name, "to": base_class, "type": "extends"})
+            edges_out.append({"from": qualified_id, "to": base_class, "type": "extends"})
 
         # ── Fix 1: with (mixin) edges ──
         decl_text = content_bytes[decl.start_byte:decl.end_byte].decode('utf-8', errors='replace')
@@ -358,20 +377,21 @@ def parse_dart_file_ts(file_path: str, repo_name: str, root_dir: str):
                 mixins_str = with_match.group(1)
                 for mixin_name in re.findall(r'(\b[A-Z]\w+)', mixins_str):
                     if mixin_name != class_name:
-                        edges_out.append({"from": class_name, "to": mixin_name, "type": "mixes_in"})
+                        edges_out.append({"from": qualified_id, "to": mixin_name, "type": "mixes_in"})
 
     if not current_classes:
         return nodes_out, edges_out, file_mapping_out
 
-    main_node = current_classes[0]
+    main_bare, main_node = current_classes[0]
+    current_bare_names = {bare for bare, _ in current_classes}
 
     # Edges từ DI patterns
     for dep in set(_RE_MODULAR_GET.findall(content)):
-        if dep != main_node:
+        if dep not in current_bare_names:
             edges_out.append({"from": main_node, "to": dep, "type": "depends_on"})
 
     for bind_target in set(_RE_BIND.findall(content)):
-        if bind_target != main_node:
+        if bind_target not in current_bare_names:
             edges_out.append({"from": main_node, "to": bind_target, "type": "binds"})
 
     for _, target_module in _RE_ROUTE_MODULE.findall(content):
@@ -385,7 +405,7 @@ def parse_dart_file_ts(file_path: str, repo_name: str, root_dir: str):
     # ── Fix 1: Constructor injection — final fields with type ──
     for typed_dep in set(_RE_TYPED_FIELD.findall(content)):
         # Only PascalCase types (class names), skip primitives
-        if typed_dep[0].isupper() and typed_dep not in current_classes and \
+        if typed_dep[0].isupper() and typed_dep not in current_bare_names and \
            typed_dep not in ('String', 'int', 'double', 'bool', 'List', 'Map',
                             'Set', 'Future', 'Stream', 'void', 'dynamic',
                             'Widget', 'BuildContext', 'Key', 'Color', 'TextStyle',
@@ -422,15 +442,17 @@ def parse_dart_file_regex(file_path: str, repo_name: str, root_dir: str):
         all_classes = event_classes + state_classes
         if all_classes:
             node_id = filename.replace('.dart', '').replace('_', ' ').title().replace(' ', '')
+            qualified_id = _make_qualified_id(relative_path, node_id)
             node_type = 'Event' if filename.endswith('_event.dart') else 'State'
             nodes_out.append({
-                "id": node_id, "type": node_type, "repo": repo_name,
+                "id": qualified_id, "type": node_type,
+                "bare_name": node_id,
                 "classes": all_classes[:20], "methods": [], "events": [],
                 "api_paths": [], "route_paths": [], "error_types": [],
             })
-            file_mapping_out[node_id] = relative_path
+            file_mapping_out[qualified_id] = {"path": relative_path, "line": 1}
             bloc_name = node_id.replace('Event', 'Bloc').replace('State', 'Bloc')
-            edges_out.append({"from": bloc_name, "to": node_id, "type": "has_part"})
+            edges_out.append({"from": qualified_id, "to": bloc_name, "type": "has_part_of"})
         return nodes_out, edges_out, file_mapping_out
 
     # Match cả class có inheritance lẫn class standalone
@@ -462,8 +484,10 @@ def parse_dart_file_regex(file_path: str, repo_name: str, root_dir: str):
     for class_name, base_class in classes:
         node_type = _classify_node(class_name, base_class)
         start_line = _char_to_line(class_lines.get(class_name, 0))
+        qualified_id = _make_qualified_id(relative_path, class_name)
         nodes_out.append({
-            "id": class_name, "type": node_type, "repo": repo_name,
+            "id": qualified_id, "type": node_type,
+            "bare_name": class_name,
             "methods": methods, "events": events, "api_paths": api_paths,
             "route_paths": route_paths, "error_types": error_types,
             "base_class": base_class,
@@ -471,18 +495,20 @@ def parse_dart_file_regex(file_path: str, repo_name: str, root_dir: str):
             "summary": _build_summary(class_name, node_type, base_class,
                                       methods, events, api_paths),
         })
-        file_mapping_out[class_name] = {"path": relative_path, "line": start_line}
-        current_classes.append(class_name)
+        file_mapping_out[qualified_id] = {"path": relative_path, "line": start_line}
+        current_classes.append((class_name, qualified_id))
 
     if not current_classes:
         return nodes_out, edges_out, file_mapping_out
 
-    main_node = current_classes[0]
+    main_bare, main_node = current_classes[0]
+    current_bare_names = {bare for bare, _ in current_classes}
+
     for dep in set(_RE_MODULAR_GET.findall(content)):
-        if dep != main_node:
+        if dep not in current_bare_names:
             edges_out.append({"from": main_node, "to": dep, "type": "depends_on"})
     for bind_target in set(_RE_BIND.findall(content)):
-        if bind_target != main_node:
+        if bind_target not in current_bare_names:
             edges_out.append({"from": main_node, "to": bind_target, "type": "binds"})
     for _, target_module in _RE_ROUTE_MODULE.findall(content):
         edges_out.append({"from": main_node, "to": target_module, "type": "routes_to"})
@@ -491,18 +517,19 @@ def parse_dart_file_regex(file_path: str, repo_name: str, root_dir: str):
     for class_name, base_class in classes:
         if base_class and base_class not in ('', 'Mixin', 'Object', 'StatelessWidget',
                                               'StatefulWidget', 'State', 'Equatable'):
-            edges_out.append({"from": class_name, "to": base_class, "type": "extends"})
+            qid = _make_qualified_id(relative_path, class_name)
+            edges_out.append({"from": qid, "to": base_class, "type": "extends"})
 
     # ── Fix 1: with (mixin) edges ──
     for with_match in _RE_WITH_SIMPLE.finditer(content):
         mixins_str = with_match.group(1)
         for mixin_name in re.findall(r'(\b[A-Z]\w+)', mixins_str):
-            if mixin_name not in current_classes:
+            if mixin_name not in current_bare_names:
                 edges_out.append({"from": main_node, "to": mixin_name, "type": "mixes_in"})
 
     # ── Fix 1: Constructor injection — final fields with type ──
     for typed_dep in set(_RE_TYPED_FIELD.findall(content)):
-        if typed_dep[0].isupper() and typed_dep not in current_classes and \
+        if typed_dep[0].isupper() and typed_dep not in current_bare_names and \
            typed_dep not in ('String', 'int', 'double', 'bool', 'List', 'Map',
                             'Set', 'Future', 'Stream', 'void', 'dynamic',
                             'Widget', 'BuildContext', 'Key', 'Color', 'TextStyle',
@@ -633,20 +660,53 @@ class FlutterModularMultiRepoParser:
         print(f"     Found {len(test_edges)} tested_by edges")
 
     def save_results(self):
-        # Deduplicate nodes
+        # ID giờ là qualified → unique, không cần dedup
+        # Nhưng vẫn dedup cho safety (nếu trùng path+class)
         unique_nodes = {}
         for n in self.nodes:
-            if n['id'] not in unique_nodes:
-                unique_nodes[n['id']] = n
+            unique_nodes[n['id']] = n  # last-write vì cùng qualified ID = cùng class
 
-        # Deduplicate edges
+        # Build alias_index: bare_name → [qualified_ids]
+        alias_index: dict[str, list[str]] = {}
+        for n in unique_nodes.values():
+            bare = n.get("bare_name", n["id"].rsplit("::", 1)[-1] if "::" in n["id"] else n["id"])
+            alias_index.setdefault(bare, []).append(n["id"])
+
+        # Edge resolution: target là bare name → resolve sang qualified ID
+        # Ưu tiên: cùng repo trước, rồi cross-repo
+        # Build lookup: bare_name → {repo: qualified_id}
+        bare_to_qualified: dict[str, dict[str, str]] = {}
+        for qid, n in unique_nodes.items():
+            bare = n.get("bare_name", qid.rsplit("::", 1)[-1] if "::" in qid else qid)
+            repo = _repo_from_path(qid.split("::")[0]) if "::" in qid else ""
+            bare_to_qualified.setdefault(bare, {})[repo] = qid
+
+        def _resolve_edge_target(bare_target: str, source_qid: str) -> str:
+            """Resolve bare name target → qualified ID. Ưu tiên cùng repo."""
+            if "::" in bare_target:
+                return bare_target  # already qualified
+            candidates = bare_to_qualified.get(bare_target)
+            if not candidates:
+                return bare_target  # dangling — giữ nguyên
+            if len(candidates) == 1:
+                return next(iter(candidates.values()))
+            # Nhiều candidate → ưu tiên cùng repo
+            source_repo = _repo_from_path(source_qid.split("::")[0]) if "::" in source_qid else ""
+            if source_repo in candidates:
+                return candidates[source_repo]
+            # Fallback: chọn cái đầu tiên (không perfect nhưng tốt hơn bare name)
+            return next(iter(candidates.values()))
+
+        # Deduplicate và resolve edges
         edge_set = set()
         unique_edges = []
         for e in self.edges:
-            key = (e['from'], e['to'], e['type'])
+            src = e['from']
+            tgt = _resolve_edge_target(e['to'], src)
+            key = (src, tgt, e['type'])
             if key not in edge_set:
                 edge_set.add(key)
-                unique_edges.append(e)
+                unique_edges.append({"from": src, "to": tgt, "type": e['type']})
 
         # similar_to edges
         unique_edges += self._build_similar_to_edges(unique_nodes, unique_edges)
@@ -655,6 +715,7 @@ class FlutterModularMultiRepoParser:
             "nodes": list(unique_nodes.values()),
             "edges": unique_edges,
             "file_mapping": self.file_mapping,
+            "alias_index": alias_index,
             "parser": "tree-sitter" if USE_TREESITTER else "regex",
         }
 
@@ -662,11 +723,18 @@ class FlutterModularMultiRepoParser:
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
+        # Stats
+        ambiguous = {k: v for k, v in alias_index.items() if len(v) > 1}
+        total_repos = len(set(_repo_from_path(n["id"].split("::")[0]) for n in unique_nodes.values() if "::" in n["id"]))
+        dangling = sum(1 for e in unique_edges if "::" not in e["to"])
+
         print("\n--- Global Workspace Extraction Complete ---")
         print(f"Parser: {'Tree-sitter ✅' if USE_TREESITTER else 'Regex (fallback)'}")
-        print(f"Total Repos Indexed: {len(set(n['repo'] for n in output['nodes']))}")
+        print(f"Total Repos Indexed: {total_repos}")
         print(f"Total Nodes: {len(output['nodes'])}")
         print(f"Total Edges: {len(unique_edges)}")
+        print(f"Alias index: {len(alias_index)} bare names, {len(ambiguous)} ambiguous")
+        print(f"Dangling edges (unresolved target): {dangling}/{len(unique_edges)} ({dangling/max(len(unique_edges),1)*100:.1f}%)")
         print(f"Output saved to: {output_file}")
 
     def _build_similar_to_edges(self, nodes_dict, edges):
@@ -711,18 +779,24 @@ class FlutterModularMultiRepoParser:
         data_edges = []
         edge_set = set()
         nodes_by_id = {n["id"]: n for n in self.nodes}
+        # Lookup bare name → first qualified ID (for base_class resolution)
+        bare_to_first_qid: dict[str, str] = {}
+        for n in self.nodes:
+            bare = n.get("bare_name", n["id"].rsplit("::", 1)[-1] if "::" in n["id"] else n["id"])
+            if bare not in bare_to_first_qid:
+                bare_to_first_qid[bare] = n["id"]
 
         # Pattern 1: Model extends Entity → data layer to domain layer
         for node in self.nodes:
             if node["type"] == "Model":
                 base = node.get("base_class", "")
-                if base and base in nodes_by_id and nodes_by_id[base]["type"] == "Model":
-                    # Model extends another Model/Entity
-                    key = (node["id"], base, "data_flows_to")
+                base_qid = bare_to_first_qid.get(base, "")
+                if base_qid and base_qid in nodes_by_id and nodes_by_id[base_qid]["type"] == "Model":
+                    key = (node["id"], base_qid, "data_flows_to")
                     if key not in edge_set:
                         edge_set.add(key)
                         data_edges.append({
-                            "from": node["id"], "to": base,
+                            "from": node["id"], "to": base_qid,
                             "type": "data_flows_to"
                         })
 
@@ -786,7 +860,8 @@ class FlutterModularMultiRepoParser:
         # Group by repo to find cross-repo entity flows
         repo_entities = {}
         for n in entity_nodes:
-            repo_entities.setdefault(n["repo"], []).append(n["id"])
+            repo = _repo_from_path(n["id"].split("::")[0]) if "::" in n["id"] else ""
+            repo_entities.setdefault(repo, []).append(n["id"])
 
         return data_edges
 

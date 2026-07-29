@@ -9,6 +9,7 @@ import pickle
 import sys
 import re
 import numpy as np
+from rank_bm25 import BM25Okapi
 from mcp.server.fastmcp import FastMCP
 from embedding_provider import create_provider
 
@@ -19,8 +20,10 @@ FPT_ROOT = "/Users/dungtv54/FPT"
 GRAPHCODE_DIR = os.path.dirname(os.path.abspath(__file__))
 GRAPH_FILE = os.path.join(GRAPHCODE_DIR, "knowledge_graph.json")
 DB_FILE = os.path.join(GRAPHCODE_DIR, "vector_db.pkl")
+BM25_FILE = os.path.join(GRAPHCODE_DIR, "bm25_index.pkl")
 HASH_STORE_FILE = os.path.join(GRAPHCODE_DIR, "file_hashes.json")
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_DOC_SCHEMA_VERSION = 3  # Bump khi đổi format document → trigger full re-embed
 
 # ─────────────────────────────────────────
 # Vietnamese keyword enrichment
@@ -221,6 +224,7 @@ class _State:
     edges = None
     model = None
     db = None
+    bm25_index = None
     adj_forward = None
     adj_reverse = None
 
@@ -241,6 +245,11 @@ def _init():
         print("Loading vector DB...", file=sys.stderr)
         with open(DB_FILE, "rb") as f:
             _State.db = pickle.load(f)
+
+    if os.path.exists(BM25_FILE):
+        print("Loading BM25 index...", file=sys.stderr)
+        with open(BM25_FILE, "rb") as f:
+            _State.bm25_index = pickle.load(f)
 
     _build_adjacency_index()
 
@@ -263,67 +272,149 @@ def _build_adjacency_index():
     _State.adj_reverse = reverse
 
 
+def _build_vi_reverse_map() -> list[tuple[str, str]]:
+    """Build reverse index: VI phrase → English keyword(s) từ VI_KEYWORDS.
+
+    Return list[(phrase, eng_keywords_str)] sorted theo len(phrase) giảm dần
+    để match n-gram dài trước ngắn.
+    Nếu 1 phrase map tới nhiều keyword (e.g. "khuyến mãi" → Voucher, Promotion),
+    gộp thành 1 string "Voucher Promotion".
+    """
+    rev: dict[str, list[str]] = {}
+    for eng, vi_str in VI_KEYWORDS.items():
+        for phrase in (p.strip().lower() for p in vi_str.split(",")):
+            if phrase:
+                rev.setdefault(phrase, [])
+                if eng not in rev[phrase]:
+                    rev[phrase].append(eng)
+    # Sort dài trước ngắn: "giỏ hàng" match trước "hàng"
+    return sorted(
+        [(phrase, " ".join(kws)) for phrase, kws in rev.items()],
+        key=lambda x: len(x[0]),
+        reverse=True,
+    )
+
+
 def _enrich_query(text: str) -> str:
     """Thêm VI_KEYWORDS vào query để tăng recall khi search.
 
-    Match case-insensitive để xử lý cả key viết hoa (OTP, SSO, QR) lẫn
-    thường (otp, sso). Trước đây dùng w.capitalize() nên "otp" → "Otp"
-    không khớp key "OTP" → miss enrichment.
+    Hai nhánh:
+    1. ASCII: match key tiếng Anh (Cart, Payment, OTP) → append VI phrases
+    2. Tiếng Việt: match phrase tiếng Việt → append English keyword (class name)
+    N-gram dài match trước ngắn để tránh khớp sai.
     """
     import re as _re
     # Build lookup viết thường 1 lần (cache trên function attribute)
     if not hasattr(_enrich_query, "_lower_map"):
         _enrich_query._lower_map = {k.lower(): v for k, v in VI_KEYWORDS.items()}
+    if not hasattr(_enrich_query, "_vi_reverse"):
+        _enrich_query._vi_reverse = _build_vi_reverse_map()
     lower_map = _enrich_query._lower_map
+    vi_reverse = _enrich_query._vi_reverse
 
-    words = _re.findall(r'[A-Za-z][A-Za-z0-9]*', text)
     extra = []
     seen = set()
+
+    # Nhánh 1: ASCII words → VI enrichment (giữ nguyên logic cũ)
+    words = _re.findall(r'[A-Za-z][A-Za-z0-9]*', text)
     for w in words:
         wl = w.lower()
         if wl in lower_map and wl not in seen:
             seen.add(wl)
             extra.append(lower_map[wl])
+
+    # Nhánh 2: VI phrase → English keyword (cho dense + BM25 match class name)
+    text_lower = text.lower()
+    for phrase, eng_kws_str in vi_reverse:  # sorted dài→ngắn
+        if phrase in text_lower:
+            for kw in eng_kws_str.split():
+                if kw.lower() not in seen:
+                    seen.add(kw.lower())
+                    extra.append(kw)
+
     if extra:
         text = text + " " + " ".join(extra)
     return text
 
 
-def _vector_search(text: str, top_k: int) -> list[str]:
-    """Vector search + lexical re-rank.
+# ─────────────────────────────────────────
+# BM25 Tokenizer
+# ─────────────────────────────────────────
+_BM25_WORD = re.compile(r'[^\W\d_]+|\d+', re.UNICODE)
 
-    Lấy pool rộng (top_k*6, tối thiểu 40) theo cosine, rồi boost node có tên class
-    khớp keyword trong query gốc. Boost phân tầng:
-      - exact match (cả query ⊆ tên hoặc tên ⊆ query): +0.20
-      - keyword khớp 1 phần trong tên: +0.08 mỗi keyword (cap +0.24)
-    Pool rộng giúp node vector-score thấp nhưng tên khớp (vd VNPayOrderModel) vẫn lọt.
+def _tokenize_for_bm25(text: str) -> list[str]:
+    """Tokenize text cho BM25: Unicode-safe.
+
+    - Tiếng Việt giữ nguyên từ (không cắt tại dấu thanh)
+    - Chỉ split camelCase khi token là ASCII alphabetic
+    - Snake_case tự tách nhờ _ bị loại bởi regex
+    """
+    tokens = []
+    for w in _BM25_WORD.findall(text):
+        wl = w.lower()
+        if len(wl) < 2:
+            continue
+        tokens.append(wl)
+        # Chỉ split camelCase cho identifier ASCII — tiếng Việt giữ nguyên
+        if w.isascii() and w.isalpha():
+            for p in re.sub(r'([a-z])([A-Z])', r'\1 \2', w).split():
+                pl = p.lower()
+                if len(pl) >= 2 and pl != wl:
+                    tokens.append(pl)
+    return tokens
+
+
+def _vector_search(text: str, top_k: int) -> list[str]:
+    """Hybrid search: BM25 keyword + Vector semantic, merge bằng Reciprocal Rank Fusion.
+
+    BM25 bắt chính xác tên class/keyword, vector bắt ngữ nghĩa.
+    RRF hợp 2 ranking → kết quả cân bằng hơn.
     """
     raw_query = text
     text = _enrich_query(text)
+
+    # --- Vector search ---
     q_vec = _State.model.encode([text], normalize_embeddings=True)
-    scores = (_State.db["embeddings"] @ q_vec.T).flatten()
+    vec_scores = (_State.db["embeddings"] @ q_vec.T).flatten()
+    vec_pool = min(len(vec_scores), max(top_k * 5, 50))
+    vec_ranked = np.argsort(vec_scores)[::-1][:vec_pool]
 
-    # Pool rộng để re-rank — quan trọng cho keyword hiếm
-    pool_size = min(len(scores), max(top_k * 5, 32))
-    pool_idx = np.argsort(scores)[::-1][:pool_size]
+    # --- BM25 search (nếu có index) ---
+    bm25_ranked = []
+    if _State.bm25_index is not None:
+        bm25_tokens = _tokenize_for_bm25(raw_query)
+        if bm25_tokens:
+            bm25_scores = _State.bm25_index.get_scores(bm25_tokens)
+            bm25_pool = min(len(bm25_scores), max(top_k * 5, 50))
+            bm25_ranked = np.argsort(bm25_scores)[::-1][:bm25_pool]
 
-    # Keyword từ query gốc — chỉ token ≥3 ký tự (tránh nhiễu "vn","qr").
-    # Bỏ stopword tiếng Việt để không boost nhầm tên class (vd "thanh"→BaoThanhNien).
+    # --- Reciprocal Rank Fusion (k=60) ---
+    K = 60
+    rrf_scores: dict = {}
+
+    for rank, idx in enumerate(vec_ranked):
+        nid = _State.db["metadata"][idx]["id"]
+        if nid not in _State.file_mapping:
+            continue
+        rrf_scores[nid] = rrf_scores.get(nid, 0) + 1.0 / (K + rank + 1)
+
+    for rank, idx in enumerate(bm25_ranked):
+        nid = _State.db["metadata"][idx]["id"]
+        if nid not in _State.file_mapping:
+            continue
+        rrf_scores[nid] = rrf_scores.get(nid, 0) + 1.0 / (K + rank + 1)
+
+    # --- Keyword boost từ tên class ---
     _VI_STOP = {"thanh", "toan", "don", "hang", "ngan", "cho", "khi", "tin",
                 "nhan", "moi", "cap", "nhat", "trang", "man", "hinh", "nguoi", "dung"}
     kws = [w.lower() for w in re.findall(r'[A-Za-z][a-z0-9]{2,}', raw_query)
            if w.lower() not in _VI_STOP]
 
     reranked = []
-    for i in pool_idx:
-        nid = _State.db["metadata"][i]["id"]
-        if nid not in _State.file_mapping:
-            continue
-        base = float(scores[i])
+    for nid, rrf_base in rrf_scores.items():
         name_lower = nid.lower()
-        # Boost: mỗi keyword khớp trong tên class +0.08, cap +0.20
-        boost = min(sum(0.08 for kw in kws if kw in name_lower), 0.20)
-        reranked.append((base + boost, nid))
+        boost = min(sum(0.003 for kw in kws if kw in name_lower), 0.01)
+        reranked.append((rrf_base + boost, nid))
 
     reranked.sort(key=lambda x: x[0], reverse=True)
     return [nid for _, nid in reranked[:top_k]]
@@ -437,6 +528,37 @@ def _node_line(node_id: str) -> int:
         return fm.get("line", 1)
     return 1
 
+
+def _resolve_node(name: str) -> tuple[list[str], bool]:
+    """Resolve tên (bare hoặc qualified) → (candidates, is_ambiguous).
+
+    - Nếu name đã là qualified (chứa '::') và tồn tại → [name], False
+    - Nếu là bare name → lookup alias_index
+    - 1 candidate → [qid], False
+    - Nhiều → list, True
+    - 0 → [name], False (giữ nguyên cho error message)
+    """
+    # Already qualified?
+    if "::" in name and name in _State.file_mapping:
+        return [name], False
+
+    alias_index = _State.graph.get("alias_index", {})
+    candidates = alias_index.get(name, [])
+
+    if len(candidates) == 1:
+        return candidates, False
+    elif len(candidates) > 1:
+        return candidates, True
+    else:
+        # Try partial match (bare name anywhere in qualified ID)
+        partial = [qid for qid in _State.file_mapping if qid.endswith(f"::{name}")]
+        if len(partial) == 1:
+            return partial, False
+        elif len(partial) > 1:
+            return partial, True
+        return [name], False
+
+
 def _to_files(nodes: list[str]) -> list[str]:
     seen, result = set(), []
     for n in nodes:
@@ -447,6 +569,73 @@ def _to_files(nodes: list[str]) -> list[str]:
                 seen.add(path)
                 result.append(path)
     return result
+
+# ─────────────────────────────────────────
+# Document builder (shared: build_db + incremental)
+# ─────────────────────────────────────────
+def _split_identifier(name: str) -> str:
+    """CamelCase → words: 'CartItemPromotion' → 'Cart Item Promotion'."""
+    parts = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+    parts = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', parts)
+    return parts
+
+
+def _leaf_path(rel_path: str) -> str:
+    """Giữ repo name + file stem, bỏ thư mục trung gian.
+
+    'khlc-cart/lib/src/features/cart/presentation/widgets/cart_item_promotiion.dart'
+    → 'khlc-cart cart_item_promotiion'
+    """
+    parts = rel_path.replace("\\", "/").split("/")
+    repo = parts[0] if parts else ""
+    stem = os.path.splitext(parts[-1])[0] if parts else ""
+    return f"{repo} {stem}" if repo != stem else repo
+
+
+def _build_node_document(node_id: str, node_meta: dict, rel_path: str) -> str:
+    """Document cho embedding + BM25. Mục tiêu <=128 token MiniLM.
+
+    Bỏ: full path (40 tok noise), import lines (67 tok noise), class body.
+    Giữ: tên class, split identifier, VI keywords, summary, leaf path, methods, api_paths.
+    """
+    # Extract bare class name từ qualified ID
+    bare_name = node_meta.get("bare_name") or (node_id.rsplit("::", 1)[-1] if "::" in node_id else node_id)
+
+    parts = [bare_name, _split_identifier(bare_name)]
+
+    vi = _enrich_vi_keywords(bare_name)
+    if vi:
+        parts.append(vi)
+
+    if node_meta.get("summary"):
+        parts.append(node_meta["summary"])
+
+    parts.append(_leaf_path(rel_path))
+
+    for key in ("methods", "events", "api_paths"):
+        vals = node_meta.get(key) or []
+        if vals:
+            parts.append(f"{key}: {', '.join(vals[:6])}")
+
+    return " | ".join(p for p in parts if p)
+
+
+# ─────────────────────────────────────────
+# Consistency guard
+# ─────────────────────────────────────────
+def _needs_full_rebuild() -> tuple[bool, str]:
+    """Kiểm tra 4 điều kiện cần full rebuild thay vì incremental."""
+    if _State.db is None or len(_State.db.get("metadata", [])) == 0:
+        return True, "vector DB rỗng"
+    if _State.db["embeddings"].shape[1] != _State.model.dimension:
+        return True, f"dimension mismatch: DB={_State.db['embeddings'].shape[1]}, model={_State.model.dimension}"
+    if _State.db.get("doc_schema") != _DOC_SCHEMA_VERSION:
+        return True, f"document schema đổi (DB={_State.db.get('doc_schema')}, current={_DOC_SCHEMA_VERSION})"
+    coverage = len(_State.db["metadata"]) / max(len(_State.file_mapping), 1)
+    if coverage < 0.9:
+        return True, f"coverage chỉ {coverage:.0%} ({len(_State.db['metadata'])}/{len(_State.file_mapping)})"
+    return False, ""
+
 
 # ─────────────────────────────────────────
 # MCP Tools
@@ -470,13 +659,15 @@ def build_db() -> str:
         print("Loading embedding model...", file=sys.stderr)
         _State.model = create_provider()
 
-    # 0. Detect dimension mismatch → force full rebuild
-    force_full_rebuild = False
-    if _State.db is not None and len(_State.db["embeddings"]) > 0:
-        existing_dim = _State.db["embeddings"].shape[1]
-        if existing_dim != _State.model.dimension:
-            print(f"Dimension mismatch: DB={existing_dim}, model={_State.model.dimension}. Full rebuild.", file=sys.stderr)
-            force_full_rebuild = True
+    # 0. Consistency guard — kiểm tra có cần full rebuild không
+    # Load DB trước nếu chưa có (cho phép check)
+    if _State.db is None and os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as f:
+            _State.db = pickle.load(f)
+
+    force_full_rebuild, rebuild_reason = _needs_full_rebuild()
+    if force_full_rebuild:
+        print(f"Full rebuild triggered: {rebuild_reason}", file=sys.stderr)
 
     # 1. Load hash store
     if os.path.exists(HASH_STORE_FILE):
@@ -486,7 +677,7 @@ def build_db() -> str:
         hash_store = {}
 
     if force_full_rebuild:
-        hash_store = {}  # Force re-hash all files
+        hash_store = {}  # Reset → mọi file sẽ được coi là changed
 
     # 2. Xác định file thay đổi / node bị xóa
     changed_files, deleted_node_ids = scan_changed_only(
@@ -516,25 +707,7 @@ def build_db() -> str:
             if nid not in remove_node_ids:
                 old_embeddings[nid] = (meta, emb)
 
-    # 6. Chuẩn bị document cho các node cần re-embed
-    _file_lines_cache: dict = {}
-
-    def _extract_class_window(full_path: str, class_name: str, window: int = 120) -> str:
-        if full_path not in _file_lines_cache:
-            try:
-                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                    _file_lines_cache[full_path] = f.readlines()
-            except Exception:
-                _file_lines_cache[full_path] = []
-        lines = _file_lines_cache[full_path]
-        pattern = re.compile(rf'\bclass\s+{re.escape(class_name)}\b')
-        start = 0
-        for i, line in enumerate(lines):
-            if pattern.search(line):
-                start = max(0, i - 3)
-                break
-        return ''.join(lines[start: start + window])
-
+    # 6. Chuẩn bị document cho các node cần re-embed (dùng _build_node_document)
     node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
     new_documents, new_metadata = [], []
 
@@ -543,26 +716,8 @@ def build_db() -> str:
             continue
         path_info = _State.file_mapping[node_id]
         rel = path_info["path"] if isinstance(path_info, dict) else path_info
-        full_path = os.path.join(FPT_ROOT, rel)
-
-        content = ""
-        if os.path.exists(full_path):
-            content = _extract_class_window(full_path, node_id)
-            if not content and full_path in _file_lines_cache:
-                content = ''.join(_file_lines_cache[full_path][:120])
-
-        vi_keywords = _enrich_vi_keywords(node_id)
-        vi_section = f"Mô tả: {vi_keywords}" if vi_keywords else ""
         node_meta = node_meta_map.get(node_id, {})
-        methods_str = ", ".join(node_meta.get("methods", []))
-        events_str = ", ".join(node_meta.get("events", []))
-        api_str = ", ".join(node_meta.get("api_paths", []))
-        meta_section = ""
-        if methods_str: meta_section += f"Methods: {methods_str}\n"
-        if events_str:  meta_section += f"Events: {events_str}\n"
-        if api_str:     meta_section += f"API paths: {api_str}\n"
-
-        text = f"Class: {node_id}\nFile: {rel}\n{vi_section}\n{meta_section}\n{content}"
+        text = _build_node_document(node_id, node_meta, rel)
         new_documents.append(text)
         new_metadata.append({"id": node_id, "file": rel})
 
@@ -588,7 +743,19 @@ def build_db() -> str:
 
     # 9. Lưu DB
     with open(DB_FILE, "wb") as f:
-        pickle.dump({"embeddings": merged, "metadata": all_meta, "model_name": MODEL_NAME}, f)
+        pickle.dump({"embeddings": merged, "metadata": all_meta, "model_name": MODEL_NAME, "doc_schema": _DOC_SCHEMA_VERSION}, f)
+
+    # 9b. Build và lưu BM25 index (dùng chung _build_node_document)
+    bm25_docs = []
+    for meta in all_meta:
+        nid = meta["id"]
+        node_m = node_meta_map.get(nid, {})
+        rel = meta.get("file", "")
+        bm25_docs.append(_build_node_document(nid, node_m, rel))
+    tokenized_corpus = [_tokenize_for_bm25(doc) for doc in bm25_docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+    with open(BM25_FILE, "wb") as f:
+        pickle.dump(bm25, f)
 
     # 10. Cập nhật hash store
     new_hash_store = {k: v for k, v in hash_store.items() if os.path.exists(k)}
@@ -609,11 +776,16 @@ def build_db() -> str:
     unchanged_count = len(old_embeddings)
     new_count = len(new_documents)
     deleted_count = len(deleted_node_ids)
-    return (
-        f"Done! {len(all_meta)} total vectors "
-        f"({new_count} re-embedded, {unchanged_count} unchanged, {deleted_count} deleted) "
-        f"— {size_mb:.1f} MB"
-    )
+    total_nodes = len(_State.file_mapping)
+    coverage = len(all_meta) / max(total_nodes, 1)
+    parts = [
+        f"Done! {len(all_meta)}/{total_nodes} nodes ({coverage:.0%} coverage)",
+        f"({new_count} re-embedded, {unchanged_count} unchanged, {deleted_count} deleted)",
+        f"— {size_mb:.1f} MB",
+    ]
+    if force_full_rebuild:
+        parts.append(f"[full rebuild: {rebuild_reason}]")
+    return " ".join(parts)
 
 
 @mcp.tool()
@@ -695,11 +867,22 @@ def get_file_content(file_path: str, start_line: int = 1, end_line: int = 0, cla
 
         # Jump đến class — dùng start_line từ graph nếu có (nhanh hơn scan)
         if class_name:
-            graph_line = _node_line(class_name)
+            # Resolve class_name → qualified ID
+            candidates, is_ambiguous = _resolve_node(class_name)
+            if is_ambiguous:
+                return json.dumps({
+                    "ambiguous": class_name,
+                    "candidates": [{"id": c, "repo": c.split("/")[0]} for c in candidates],
+                    "hint": "Truyền id đầy đủ (qualified) hoặc file_path cụ thể"
+                }, ensure_ascii=False, indent=2)
+            resolved_class = candidates[0]
+            # Extract bare name for regex search
+            bare = resolved_class.rsplit("::", 1)[-1] if "::" in resolved_class else resolved_class
+            graph_line = _node_line(resolved_class)
             if graph_line > 1:
                 start_line = max(1, graph_line - 2)
             else:
-                pattern = re.compile(rf'\bclass\s+{re.escape(class_name)}\b')
+                pattern = re.compile(rf'\bclass\s+{re.escape(bare)}\b')
                 for i, line in enumerate(all_lines):
                     if pattern.search(line):
                         start_line = max(1, i - 2)
@@ -743,7 +926,7 @@ def search_by_api_path(path: str) -> str:
             results.append({
                 "node": node["id"],
                 "type": node["type"],
-                "repo": node.get("repo", ""),
+                "repo": node["id"].split("/")[0] if "/" in node.get("id","") else "",
                 "api_paths": api_paths,
                 "file": os.path.join(FPT_ROOT, file_path) if file_path else "",
             })
@@ -770,7 +953,7 @@ def search_by_error_type(error_type: str) -> str:
             results.append({
                 "node": node["id"],
                 "type": node["type"],
-                "repo": node.get("repo", ""),
+                "repo": node["id"].split("/")[0] if "/" in node["id"] else "",
                 "error_types": error_types,
                 "file": os.path.join(FPT_ROOT, file_path) if file_path else "",
             })
@@ -789,19 +972,28 @@ def find_similar_modules(module_name: str) -> str:
         module_name: Tên module cần tìm template, ví dụ: 'InfographicModule'
     """
     _init()
+
+    # Resolve module name
+    candidates, is_ambiguous = _resolve_node(module_name)
+    if is_ambiguous:
+        return json.dumps({
+            "ambiguous": module_name,
+            "candidates": [{"id": c, "repo": c.split("/")[0]} for c in candidates],
+            "hint": "Truyền id đầy đủ (qualified) để phân tích chính xác"
+        }, ensure_ascii=False, indent=2)
+    resolved_name = candidates[0]
+
     # Lấy các UseCase mà module này bind
     target_usecases = set()
     for edge in _State.edges:
-        if edge["from"] == module_name and edge["type"] == "binds":
+        if edge["from"] == resolved_name and edge["type"] == "binds":
             if "UseCase" in edge["to"]:
-                # Lấy suffix pattern: GetXxxPageUseCase → GetXxxPageUseCase pattern
-                uc = edge["to"]
-                target_usecases.add(uc)
+                target_usecases.add(edge["to"])
 
     # Tìm module khác có UseCase pattern tương tự
     module_scores = {}
     for edge in _State.edges:
-        if edge["type"] == "binds" and "UseCase" in edge["to"] and edge["from"] != module_name:
+        if edge["type"] == "binds" and "UseCase" in edge["to"] and edge["from"] != resolved_name:
             other_module = edge["from"]
             other_uc = edge["to"]
             # So sánh suffix pattern (bỏ prefix Get/Create/Delete)
@@ -822,7 +1014,7 @@ def find_similar_modules(module_name: str) -> str:
         results.append({
             "module": mod,
             "similarity_score": score,
-            "repo": mod_node.get("repo", ""),
+            "repo": mod_node["id"].split("/")[0] if "/" in mod_node.get("id","") else "",
             "file": os.path.join(FPT_ROOT, file_path) if file_path else "",
         })
     return json.dumps(results, ensure_ascii=False, indent=2)
@@ -840,6 +1032,22 @@ def get_blast_radius(node_id: str, max_depth: int = 4) -> str:
     """
     _init()
 
+    # Resolve node name → qualified ID
+    candidates, is_ambiguous = _resolve_node(node_id)
+    if is_ambiguous:
+        # Trả danh sách candidate để agent chọn — KHÔNG trộn kết quả
+        result = {
+            "ambiguous": node_id,
+            "candidates": [],
+            "hint": "Truyền id đầy đủ (qualified) để phân tích chính xác"
+        }
+        for qid in candidates:
+            repo = qid.split("/")[0] if "/" in qid else ""
+            result["candidates"].append({"id": qid, "repo": repo})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    resolved_id = candidates[0]
+
     # Tìm tất cả nodes phụ thuộc vào node_id (reverse traversal)
     affected = {}  # node_id -> {depth, edge_type, path}
 
@@ -847,7 +1055,8 @@ def get_blast_radius(node_id: str, max_depth: int = 4) -> str:
         if depth > max_depth:
             return
         for (caller, etype) in _State.adj_reverse.get(node, []):
-            if etype in ("depends_on", "binds", "has_part", "data_flows_to",
+            if etype in ("depends_on", "binds", "has_part", "has_part_of",
+                         "data_flows_to",
                          "extends", "mixes_in", "imports_from", "imports_local"):
                 if caller not in affected:
                     affected[caller] = {
@@ -857,17 +1066,17 @@ def get_blast_radius(node_id: str, max_depth: int = 4) -> str:
                     }
                     reverse_dfs(caller, depth + 1, path + [caller])
 
-    reverse_dfs(node_id, 1, [node_id])
+    reverse_dfs(resolved_id, 1, [resolved_id])
 
     if not affected:
-        return json.dumps({"node": node_id, "message": "No dependents found — safe to change"})
+        return json.dumps({"node": resolved_id, "message": "No dependents found — safe to change"})
 
     # Group by node type
     grouped = {}
     for nid, info in affected.items():
         node_meta = next((n for n in _State.graph["nodes"] if n["id"] == nid), {})
         ntype = node_meta.get("type", "Unknown")
-        repo = node_meta.get("repo", "")
+        repo = nid.split("/")[0] if "/" in nid else ""
         if ntype not in grouped:
             grouped[ntype] = []
         grouped[ntype].append({
@@ -884,7 +1093,7 @@ def get_blast_radius(node_id: str, max_depth: int = 4) -> str:
     summary = {k: len(v) for k, v in grouped.items()}
 
     return json.dumps({
-        "node": node_id,
+        "node": resolved_id,
         "total_affected": len(affected),
         "summary": summary,
         "affected_by_type": grouped,
@@ -939,7 +1148,7 @@ def detect_communities(min_size: int = 3) -> str:
         node_types = {}
         for nid in member_nodes:
             meta = next((n for n in _State.graph["nodes"] if n["id"] == nid), {})
-            repo = meta.get("repo", "unknown")
+            repo = nid.split("/")[0] if "/" in nid else "unknown"
             ntype = meta.get("type", "Unknown")
             repo_count[repo] = repo_count.get(repo, 0) + 1
             node_types[ntype] = node_types.get(ntype, 0) + 1
@@ -1001,7 +1210,7 @@ def get_architecture_overview() -> str:
         {
             "node": nodes[i],
             "degree": degrees[i],
-            "repo": next((n.get("repo","") for n in _State.graph["nodes"] if n["id"]==nodes[i]), ""),
+            "repo": nodes[i].split("/")[0] if "/" in nodes[i] else "",
             "type": next((n.get("type","") for n in _State.graph["nodes"] if n["id"]==nodes[i]), ""),
         }
         for i in range(len(nodes)) if degrees[i] >= hub_threshold
@@ -1015,7 +1224,7 @@ def get_architecture_overview() -> str:
         {
             "node": nodes[i],
             "betweenness": round(betweenness[i], 2),
-            "repo": next((n.get("repo","") for n in _State.graph["nodes"] if n["id"]==nodes[i]), ""),
+            "repo": nodes[i].split("/")[0] if "/" in nodes[i] else "",
         }
         for i in range(len(nodes)) if betweenness[i] >= bridge_threshold and betweenness[i] > 0
     ]
@@ -1024,10 +1233,10 @@ def get_architecture_overview() -> str:
     # Repo coupling: edges giữa các repo khác nhau
     cross_repo_edges = []
     for edge in _State.edges:
-        from_meta = next((n for n in _State.graph["nodes"] if n["id"]==edge["from"]), {})
-        to_meta = next((n for n in _State.graph["nodes"] if n["id"]==edge["to"]), {})
-        from_repo = from_meta.get("repo","")
-        to_repo = to_meta.get("repo","")
+        from_id = edge["from"]
+        to_id = edge["to"]
+        from_repo = from_id.split("/")[0] if "/" in from_id else ""
+        to_repo = to_id.split("/")[0] if "/" in to_id else ""
         if from_repo and to_repo and from_repo != to_repo:
             key = tuple(sorted([from_repo, to_repo]))
             cross_repo_edges.append(key)
@@ -1043,7 +1252,7 @@ def get_architecture_overview() -> str:
         "graph_stats": {
             "total_nodes": len(nodes),
             "total_edges": len(edges_ig),
-            "repos": len(set(n.get("repo","") for n in _State.graph["nodes"])),
+            "repos": len(set(n["id"].split("/")[0] for n in _State.graph["nodes"] if "/" in n["id"])),
         },
         "hub_nodes": hubs[:10],
         "bridge_nodes": bridges[:5],
@@ -1392,7 +1601,7 @@ def _incremental_rebuild(changed_files: list[str]):
             if meta["id"] not in changed_node_ids:
                 old_embeddings[meta["id"]] = (meta, emb)
 
-    # Re-embed changed nodes
+    # Re-embed changed nodes (dùng _build_node_document — cùng format với build_db)
     node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
     new_documents, new_metadata = [], []
     for node_id in changed_node_ids:
@@ -1400,17 +1609,8 @@ def _incremental_rebuild(changed_files: list[str]):
             continue
         path_info = _State.file_mapping[node_id]
         rel = path_info["path"] if isinstance(path_info, dict) else path_info
-        full_path = os.path.join(FPT_ROOT, rel)
-        content = ""
-        if os.path.exists(full_path):
-            try:
-                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read(4096)
-            except Exception:
-                pass
-        vi_keywords = _enrich_vi_keywords(node_id)
-        vi_section = f"Mô tả: {vi_keywords}" if vi_keywords else ""
-        text = f"Class: {node_id}\nFile: {rel}\n{vi_section}\n{content[:3000]}"
+        node_meta = node_meta_map.get(node_id, {})
+        text = _build_node_document(node_id, node_meta, rel)
         new_documents.append(text)
         new_metadata.append({"id": node_id, "file": rel})
 
@@ -1429,7 +1629,7 @@ def _incremental_rebuild(changed_files: list[str]):
     merged = np.array(all_embs) if all_embs else np.empty((0, _State.model.dimension))
 
     with open(DB_FILE, "wb") as f:
-        pickle.dump({"embeddings": merged, "metadata": all_meta, "model_name": MODEL_NAME}, f)
+        pickle.dump({"embeddings": merged, "metadata": all_meta, "model_name": MODEL_NAME, "doc_schema": _DOC_SCHEMA_VERSION}, f)
 
     # Update hash store
     for abs_path in changed_files:
@@ -1442,7 +1642,19 @@ def _incremental_rebuild(changed_files: list[str]):
     with open(DB_FILE, "rb") as f:
         _State.db = pickle.load(f)
 
-    print(f"[rebuild] {len(new_documents)} nodes re-embedded", file=sys.stderr)
+    # Rebuild BM25 (giữ đồng bộ với vector DB)
+    bm25_docs = []
+    for meta in all_meta:
+        nid = meta["id"]
+        node_m = node_meta_map.get(nid, {})
+        rel = meta.get("file", "")
+        bm25_docs.append(_build_node_document(nid, node_m, rel))
+    tokenized_corpus = [_tokenize_for_bm25(doc) for doc in bm25_docs]
+    _State.bm25_index = BM25Okapi(tokenized_corpus)
+    with open(BM25_FILE, "wb") as f:
+        pickle.dump(_State.bm25_index, f)
+
+    print(f"[rebuild] {len(new_documents)} nodes re-embedded, BM25 synced", file=sys.stderr)
 
 
 # ─────────────────────────────────────────
@@ -1488,8 +1700,8 @@ def get_repo_coupling() -> str:
     for edge in _State.edges:
         from_node = node_meta_map.get(edge["from"], {})
         to_node = node_meta_map.get(edge["to"], {})
-        from_repo = from_node.get("repo", "")
-        to_repo = to_node.get("repo", "")
+        from_repo = edge["from"].split("/")[0] if "/" in edge["from"] else ""
+        to_repo = edge["to"].split("/")[0] if "/" in edge["to"] else ""
         if from_repo and to_repo and from_repo != to_repo:
             repo_deps.setdefault(from_repo, {})
             repo_deps[from_repo][to_repo] = repo_deps[from_repo].get(to_repo, 0) + 1

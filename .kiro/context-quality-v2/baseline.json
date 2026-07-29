@@ -1,0 +1,555 @@
+{
+  "node_count": 8410,
+  "queries": [
+    {
+      "query": "giỏ hàng thêm sản phẩm khuyến mãi",
+      "enrich_result": "giỏ hàng thêm sản phẩm khuyến mãi",
+      "bm25_top5": [
+        {
+          "node": "PricePromotionTag",
+          "score": 25.0064
+        },
+        {
+          "node": "PriceX",
+          "score": 24.9811
+        },
+        {
+          "node": "ProductPricePromotionTag",
+          "score": 24.7464
+        },
+        {
+          "node": "PriceWidget",
+          "score": 23.8749
+        },
+        {
+          "node": "PriceEntity",
+          "score": 23.8749
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "ProductPricePromotionTag",
+          "score": 0.5335
+        },
+        {
+          "node": "ProductShopSuggestionState",
+          "score": 0.5306
+        },
+        {
+          "node": "ProductPrice",
+          "score": 0.5298
+        },
+        {
+          "node": "ProductShopSuggestionEvent",
+          "score": 0.5246
+        },
+        {
+          "node": "ProductSearchResultAggregationEntity",
+          "score": 0.5245
+        }
+      ],
+      "hybrid_top5": [
+        "ProductPricePromotionTag",
+        "ProductPrice",
+        "ProductPromotion",
+        "ProductPromotionEntity",
+        "ProductPromotionItemEntity"
+      ]
+    },
+    {
+      "query": "địa chỉ giao hàng tỉnh thành phố",
+      "enrich_result": "địa chỉ giao hàng tỉnh thành phố",
+      "bm25_top5": [
+        {
+          "node": "Dc5Address",
+          "score": 18.4307
+        },
+        {
+          "node": "Address",
+          "score": 18.4307
+        },
+        {
+          "node": "Dc5DeliveryAddress",
+          "score": 17.4871
+        },
+        {
+          "node": "DeliveryAddress",
+          "score": 17.4871
+        },
+        {
+          "node": "LegacyAddress",
+          "score": 17.1352
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "CityEntity",
+          "score": 0.5182
+        },
+        {
+          "node": "CityModel",
+          "score": 0.4589
+        },
+        {
+          "node": "AddressDetailEntity",
+          "score": 0.447
+        },
+        {
+          "node": "LocationAddressEntity",
+          "score": 0.4154
+        },
+        {
+          "node": "ProvinceListResponseModel",
+          "score": 0.3845
+        }
+      ],
+      "hybrid_top5": [
+        "AddressEntity",
+        "LocationAddressEntity",
+        "Address",
+        "DeliveryAddress",
+        "Dc5DeliveryAddress"
+      ]
+    },
+    {
+      "query": "lịch sử mua hàng đơn hàng",
+      "enrich_result": "lịch sử mua hàng đơn hàng",
+      "bm25_top5": [
+        {
+          "node": "OrderHistoryDummy",
+          "score": 21.2172
+        },
+        {
+          "node": "OrderHistoryState",
+          "score": 21.2172
+        },
+        {
+          "node": "OrderHistoryEntity",
+          "score": 21.2172
+        },
+        {
+          "node": "OrderHistoryEvent",
+          "score": 21.2172
+        },
+        {
+          "node": "OrderHistoryView",
+          "score": 21.2172
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "PurchasingOrderProductState",
+          "score": 0.4099
+        },
+        {
+          "node": "BuyerInfoParams",
+          "score": 0.3914
+        },
+        {
+          "node": "PurchaseHistoryRecordModel",
+          "score": 0.3861
+        },
+        {
+          "node": "PurchaseHistoryRecordEntity",
+          "score": 0.3794
+        },
+        {
+          "node": "BuyerInfoParam",
+          "score": 0.3781
+        }
+      ],
+      "hybrid_top5": [
+        "OrderHistoryDummy",
+        "OrderHistoryUseCase",
+        "ListOrderHistoryState",
+        "OrderHistoryDataSource",
+        "OrderHistoryState"
+      ]
+    },
+    {
+      "query": "thanh toán online chuyển khoản",
+      "enrich_result": "thanh toán online chuyển khoản",
+      "bm25_top5": [
+        {
+          "node": "PaymentZalopayEvent",
+          "score": 15.6333
+        },
+        {
+          "node": "ZaloPayPaymentParam",
+          "score": 15.6333
+        },
+        {
+          "node": "PaymentDigitalState",
+          "score": 15.4622
+        },
+        {
+          "node": "PaymentDigitalRepo",
+          "score": 15.4622
+        },
+        {
+          "node": "PaymentDigitalEvent",
+          "score": 15.4622
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "PaymentDigitalEvent",
+          "score": 0.5245
+        },
+        {
+          "node": "PaymentDigitalState",
+          "score": 0.5205
+        },
+        {
+          "node": "PaymentDigitalBloc",
+          "score": 0.5043
+        },
+        {
+          "node": "WebPaymentResultArgs",
+          "score": 0.5021
+        },
+        {
+          "node": "_PaymentWebViewPageState",
+          "score": 0.5011
+        }
+      ],
+      "hybrid_top5": [
+        "PaymentDigitalState",
+        "PaymentDigitalEvent",
+        "PaymentMethodsPage",
+        "PaymentDigitalRepo",
+        "PaymentDigitalRepoImpl"
+      ]
+    },
+    {
+      "query": "đăng nhập OTP xác thực",
+      "enrich_result": "đăng nhập OTP xác thực mã OTP, xác minh điện thoại",
+      "bm25_top5": [
+        {
+          "node": "AuthGatewayOTP",
+          "score": 28.872
+        },
+        {
+          "node": "FPTAnalyticsAuth",
+          "score": 26.5501
+        },
+        {
+          "node": "AppAuth",
+          "score": 26.5501
+        },
+        {
+          "node": "AuthInterceptor",
+          "score": 26.5501
+        },
+        {
+          "node": "KHLCAuthService",
+          "score": 24.2418
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "PhoneNumberInputSocialBloc",
+          "score": 0.5416
+        },
+        {
+          "node": "PhoneInputBloc",
+          "score": 0.5256
+        },
+        {
+          "node": "PhoneInputEvent",
+          "score": 0.5103
+        },
+        {
+          "node": "OtpInputArgs",
+          "score": 0.5094
+        },
+        {
+          "node": "OtpInputBloc",
+          "score": 0.4941
+        }
+      ],
+      "hybrid_top5": [
+        "AuthModule",
+        "ConfirmOtpEvent",
+        "ConfirmOtpState",
+        "ConfirmOtpBloc",
+        "ConfirmPhonePage"
+      ]
+    },
+    {
+      "query": "tìm kiếm sản phẩm theo tên",
+      "enrich_result": "tìm kiếm sản phẩm theo tên",
+      "bm25_top5": [
+        {
+          "node": "SearchProductResultEntity",
+          "score": 19.3887
+        },
+        {
+          "node": "ProductSearchResultEntity",
+          "score": 19.3887
+        },
+        {
+          "node": "ProductSearchResultModel",
+          "score": 19.3887
+        },
+        {
+          "node": "SearchSuggestionProductResource",
+          "score": 19.2225
+        },
+        {
+          "node": "ProductSearchResultAggregationEntity",
+          "score": 19.0591
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "SearchSuggestionKeywordAndProductEntity",
+          "score": 0.5453
+        },
+        {
+          "node": "ProductShopSuggestionListShortWidget",
+          "score": 0.5378
+        },
+        {
+          "node": "ProductSearchCategoryEntity",
+          "score": 0.5322
+        },
+        {
+          "node": "ProductShopSuggestionState",
+          "score": 0.53
+        },
+        {
+          "node": "ProductSearchPriceEntity",
+          "score": 0.5286
+        }
+      ],
+      "hybrid_top5": [
+        "ProductSearchResultEntity",
+        "SearchSuggestionKeywordAndProductEntity",
+        "SearchSuggestionKeywordProductModel",
+        "ProductSearchResultAggregationEntity",
+        "SearchProductState"
+      ]
+    },
+    {
+      "query": "voucher mã giảm giá áp dụng",
+      "enrich_result": "voucher mã giảm giá áp dụng voucher, mã giảm giá, khuyến mãi",
+      "bm25_top5": [
+        {
+          "node": "ListVoucherX",
+          "score": 22.465
+        },
+        {
+          "node": "VoucherEntity",
+          "score": 22.465
+        },
+        {
+          "node": "VoucherChip",
+          "score": 22.465
+        },
+        {
+          "node": "VoucherSelected",
+          "score": 22.465
+        },
+        {
+          "node": "VoucherTicket",
+          "score": 22.465
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "VoucherSelected",
+          "score": 0.5488
+        },
+        {
+          "node": "VoucherDetail",
+          "score": 0.5319
+        },
+        {
+          "node": "VoucherEntity",
+          "score": 0.5085
+        },
+        {
+          "node": "VoucherGiftModel",
+          "score": 0.5059
+        },
+        {
+          "node": "VoucherDetailGift",
+          "score": 0.5022
+        }
+      ],
+      "hybrid_top5": [
+        "VoucherSelected",
+        "VoucherEntity",
+        "ExchangedVoucherEntity",
+        "VoucherCheckParam",
+        "VoucherDataModel"
+      ]
+    },
+    {
+      "query": "thông báo push notification",
+      "enrich_result": "thông báo push notification thông báo, push notification",
+      "bm25_top5": [
+        {
+          "node": "NotificationFactory",
+          "score": 23.9568
+        },
+        {
+          "node": "NotificationDelegate",
+          "score": 23.9568
+        },
+        {
+          "node": "NotificationLc247Factory",
+          "score": 23.9568
+        },
+        {
+          "node": "NotificationPage",
+          "score": 23.9568
+        },
+        {
+          "node": "NotificationEntity",
+          "score": 23.9568
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "NotificationReminderBanner",
+          "score": 0.5418
+        },
+        {
+          "node": "PromotionNotificationBloc",
+          "score": 0.4992
+        },
+        {
+          "node": "NotificationBloc",
+          "score": 0.4941
+        },
+        {
+          "node": "NotificationDetailState",
+          "score": 0.4801
+        },
+        {
+          "node": "NotificationBannerState",
+          "score": 0.4797
+        }
+      ],
+      "hybrid_top5": [
+        "NotificationDelegate",
+        "NotificationItem",
+        "NotificationEvent",
+        "NotificationAdditionModel",
+        "NotificationReminderBanner"
+      ]
+    },
+    {
+      "query": "hồ sơ sức khỏe bệnh nhân",
+      "enrich_result": "hồ sơ sức khỏe bệnh nhân",
+      "bm25_top5": [
+        {
+          "node": "GroupHealthParam",
+          "score": 18.6403
+        },
+        {
+          "node": "GroupHealthPageResource",
+          "score": 18.0866
+        },
+        {
+          "node": "GroupHealthPageResponse",
+          "score": 18.0866
+        },
+        {
+          "node": "GroupHealthPageColumn",
+          "score": 18.0866
+        },
+        {
+          "node": "GroupHealthPageResource2",
+          "score": 18.0866
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "_MedicineFullMonthCalendarState",
+          "score": 0.4698
+        },
+        {
+          "node": "HealthCornerDetailCategoryBloc",
+          "score": 0.4636
+        },
+        {
+          "node": "HealthCornerDetailCategoryDataChildEntity",
+          "score": 0.4631
+        },
+        {
+          "node": "HealthCornerDetailCategoryDataEntity",
+          "score": 0.4584
+        },
+        {
+          "node": "HealthCornerDetailCategoryState",
+          "score": 0.4565
+        }
+      ],
+      "hybrid_top5": [
+        "HealthCornerCategoryLevel2Data",
+        "HealthCornerCategoryLevel2Model",
+        "DataHealthCornerCategoryLevel2Model",
+        "HealthOverviewPage",
+        "RelatedArticleHealthPage"
+      ]
+    },
+    {
+      "query": "đặt lịch hẹn khám bệnh",
+      "enrich_result": "đặt lịch hẹn khám bệnh",
+      "bm25_top5": [
+        {
+          "node": "ScheduleModel",
+          "score": 22.4409
+        },
+        {
+          "node": "ScheduleModelMapper",
+          "score": 21.539
+        },
+        {
+          "node": "UpComingScheduleSection",
+          "score": 20.7102
+        },
+        {
+          "node": "ScheduleInjectionListItem",
+          "score": 20.7102
+        },
+        {
+          "node": "UpComingScheduleWidget",
+          "score": 20.7102
+        }
+      ],
+      "vector_top5": [
+        {
+          "node": "_MedicineScheduleListTimeHeaderState",
+          "score": 0.6096
+        },
+        {
+          "node": "ScheduleDateRoutinesResource",
+          "score": 0.6053
+        },
+        {
+          "node": "MedicineScheduleRemoteDataSource",
+          "score": 0.6023
+        },
+        {
+          "node": "ScheduleDatePrescriptionsResource",
+          "score": 0.5946
+        },
+        {
+          "node": "MedicineScheduleMasterDataRepositoryImpl",
+          "score": 0.5845
+        }
+      ],
+      "hybrid_top5": [
+        "ScheduleDateRoutinesResource",
+        "ScheduleDatePrescriptionsResource",
+        "MedicineScheduleRemoteDataSource",
+        "ScheduleModel",
+        "MedicineScheduleItem"
+      ]
+    }
+  ]
+}
