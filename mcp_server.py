@@ -789,7 +789,7 @@ def build_db() -> str:
 
 
 @mcp.tool()
-def query_context(query: str, top_k: int = 8, snippet_chars: int = 300) -> str:
+def query_context(query: str, top_k: int = 8, snippet_chars: int = 300, verbose: bool = False) -> str:
     """
     Tìm các file Flutter liên quan đến query dựa trên semantic search + knowledge graph.
     Trả về file paths, graph relationships, và snippet ngắn của mỗi file.
@@ -799,6 +799,7 @@ def query_context(query: str, top_k: int = 8, snippet_chars: int = 300) -> str:
         query: Câu hỏi hoặc mô tả tính năng cần tìm (tiếng Việt hoặc tiếng Anh)
         top_k: Số lượng kết quả vector search (mặc định 8)
         snippet_chars: Số ký tự preview mỗi file để nhận diện nhanh (mặc định 300, đặt 0 để tắt)
+        verbose: Nếu True, trả thêm flow_nodes và flow_files (mặc định False để tiết kiệm token)
     """
     try:
         _init()
@@ -815,11 +816,13 @@ def query_context(query: str, top_k: int = 8, snippet_chars: int = 300) -> str:
         files_with_content = []
         for node_id, file_path in zip(base_nodes, files):
             meta = node_meta_map.get(node_id, {})
+            # Relative path
+            rel_path = os.path.relpath(file_path, FPT_ROOT) if file_path.startswith(FPT_ROOT) else file_path
             entry: dict = {
-                "node": node_id,
-                "path": file_path,
-                "line": _node_line(node_id),       # jump thẳng đến class
-                "summary": meta.get("summary", ""), # ~20 tokens, rất informative
+                "node": node_id.rsplit("::", 1)[-1] if "::" in node_id else node_id,
+                "path": rel_path,
+                "line": _node_line(node_id),
+                "summary": meta.get("summary", ""),
             }
             # Chỉ đọc file nếu summary rỗng (node cũ chưa có summary)
             if not entry["summary"] and snippet_chars > 0:
@@ -830,15 +833,18 @@ def query_context(query: str, top_k: int = 8, snippet_chars: int = 300) -> str:
                     pass
             files_with_content.append(entry)
 
-        result = {
+        result: dict = {
+            "root": FPT_ROOT,
             "files": files_with_content,
-            "flow_files": _to_files(flow_nodes)[:15],
             "graph": _graph_info(flow_nodes),
-            "flow_nodes": flow_nodes[:18],
         }
 
+        if verbose:
+            result["flow_nodes"] = flow_nodes[:18]
+            result["flow_files"] = _to_files(flow_nodes)[:15]
+
         _log_query(query, top_k, base_nodes, len(flow_nodes), success=True)
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return json.dumps(result, ensure_ascii=False, separators=(',', ':'))
 
     except Exception as e:
         _log_query(query, top_k, [], 0, success=False, error=str(e))
@@ -1021,7 +1027,7 @@ def find_similar_modules(module_name: str) -> str:
 
 
 @mcp.tool()
-def get_blast_radius(node_id: str, max_depth: int = 4) -> str:
+def get_blast_radius(node_id: str, max_depth: int = 4, verbose: bool = False) -> str:
     """
     Tìm tất cả nodes bị ảnh hưởng nếu thay đổi node này.
     Dùng khi muốn biết sửa file X sẽ ảnh hưởng đến đâu.
@@ -1069,35 +1075,37 @@ def get_blast_radius(node_id: str, max_depth: int = 4) -> str:
     reverse_dfs(resolved_id, 1, [resolved_id])
 
     if not affected:
-        return json.dumps({"node": resolved_id, "message": "No dependents found — safe to change"})
+        return json.dumps({"node": resolved_id, "message": "No dependents found — safe to change"}, separators=(',', ':'))
 
-    # Group by node type
-    grouped = {}
+    # Group by repo
+    by_repo: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    details = []
     for nid, info in affected.items():
+        repo = nid.split("/")[0] if "/" in nid else "unknown"
+        by_repo[repo] = by_repo.get(repo, 0) + 1
         node_meta = next((n for n in _State.graph["nodes"] if n["id"] == nid), {})
         ntype = node_meta.get("type", "Unknown")
-        repo = nid.split("/")[0] if "/" in nid else ""
-        if ntype not in grouped:
-            grouped[ntype] = []
-        grouped[ntype].append({
-            "node": nid,
-            "repo": repo,
-            "depth": info["depth"],
-            "file": os.path.join(FPT_ROOT, _node_path(nid)) if nid in _State.file_mapping else "",
-        })
+        by_type[ntype] = by_type.get(ntype, 0) + 1
+        if verbose:
+            details.append({
+                "node": nid.rsplit("::", 1)[-1] if "::" in nid else nid,
+                "repo": repo,
+                "type": ntype,
+                "depth": info["depth"],
+            })
 
-    # Sort each group by depth
-    for g in grouped.values():
-        g.sort(key=lambda x: x["depth"])
-
-    summary = {k: len(v) for k, v in grouped.items()}
-
-    return json.dumps({
+    result: dict = {
         "node": resolved_id,
         "total_affected": len(affected),
-        "summary": summary,
-        "affected_by_type": grouped,
-    }, ensure_ascii=False, indent=2)
+        "by_repo": by_repo,
+        "by_type": by_type,
+    }
+    if verbose:
+        details.sort(key=lambda x: x["depth"])
+        result["details"] = details
+
+    return json.dumps(result, ensure_ascii=False, separators=(',', ':'))
 
 
 @mcp.tool()
@@ -1118,6 +1126,8 @@ def detect_communities(min_size: int = 3) -> str:
     # Build igraph từ edges
     nodes = list(_State.file_mapping.keys())
     node_index = {n: i for i, n in enumerate(nodes)}
+    # Build node_meta_map MỘT LẦN — tránh O(n²) linear scan
+    node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
 
     edges_ig = []
     for edge in _State.edges:
@@ -1147,7 +1157,7 @@ def detect_communities(min_size: int = 3) -> str:
         repo_count = {}
         node_types = {}
         for nid in member_nodes:
-            meta = next((n for n in _State.graph["nodes"] if n["id"] == nid), {})
+            meta = node_meta_map.get(nid, {})
             repo = nid.split("/")[0] if "/" in nid else "unknown"
             ntype = meta.get("type", "Unknown")
             repo_count[repo] = repo_count.get(repo, 0) + 1
@@ -1195,6 +1205,8 @@ def get_architecture_overview() -> str:
 
     nodes = list(_State.file_mapping.keys())
     node_index = {n: i for i, n in enumerate(nodes)}
+    # Build node_meta_map MỘT LẦN — tránh O(n²) linear scan
+    node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
 
     edges_ig = []
     for edge in _State.edges:
@@ -1211,7 +1223,7 @@ def get_architecture_overview() -> str:
             "node": nodes[i],
             "degree": degrees[i],
             "repo": nodes[i].split("/")[0] if "/" in nodes[i] else "",
-            "type": next((n.get("type","") for n in _State.graph["nodes"] if n["id"]==nodes[i]), ""),
+            "type": node_meta_map.get(nodes[i], {}).get("type", ""),
         }
         for i in range(len(nodes)) if degrees[i] >= hub_threshold
     ]
@@ -1330,8 +1342,17 @@ def search_by_filename(pattern: str, repo: str = "") -> str:
     """
     import fnmatch
 
+    _init()
     pattern_lower = pattern.lower().replace('*', '')
     results = []
+
+    # Build set of known paths MỘT LẦN — tránh O(n²)
+    graph_paths = set()
+    if _State.file_mapping:
+        for nid in _State.file_mapping:
+            p = _node_path(nid)
+            if p:
+                graph_paths.add(p)
 
     search_root = os.path.join(FPT_ROOT, repo) if repo else FPT_ROOT
 
@@ -1351,11 +1372,7 @@ def search_by_filename(pattern: str, repo: str = "") -> str:
             if fnmatch.fnmatch(fname.lower(), f"*{pattern_lower}*"):
                 full_path = os.path.join(dirpath, fname)
                 rel = os.path.relpath(full_path, FPT_ROOT)
-                # Kiểm tra xem file này có trong graph không
-                in_graph = any(
-                    _node_path(nid) == rel or _node_path(nid).endswith(fname)
-                    for nid in _State.file_mapping
-                ) if _State.file_mapping else False
+                in_graph = rel in graph_paths  # O(1) lookup
                 results.append({
                     "file": full_path,
                     "relative": rel,
@@ -1368,7 +1385,7 @@ def search_by_filename(pattern: str, repo: str = "") -> str:
 
     if not results:
         return json.dumps({"message": f"No .dart files found matching '{pattern}'"})
-    return json.dumps(results, ensure_ascii=False, indent=2)
+    return json.dumps(results, ensure_ascii=False, separators=(',', ':'))
 
 
 @mcp.tool()
@@ -1695,11 +1712,8 @@ def get_repo_coupling() -> str:
 
     # Build dependency matrix from cross-repo edges
     repo_deps: dict = {}  # {from_repo: {to_repo: count}}
-    node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
 
     for edge in _State.edges:
-        from_node = node_meta_map.get(edge["from"], {})
-        to_node = node_meta_map.get(edge["to"], {})
         from_repo = edge["from"].split("/")[0] if "/" in edge["from"] else ""
         to_repo = edge["to"].split("/")[0] if "/" in edge["to"] else ""
         if from_repo and to_repo and from_repo != to_repo:
