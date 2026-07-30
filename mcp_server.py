@@ -1074,8 +1074,15 @@ def get_blast_radius(node_id: str, max_depth: int = 4, verbose: bool = False) ->
 
     reverse_dfs(resolved_id, 1, [resolved_id])
 
+    # Get visibility of the node
+    node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
+    resolved_meta = node_meta_map.get(resolved_id, {})
+    visibility = resolved_meta.get("visibility", "unknown")
+    node_repo = resolved_id.split("/")[0] if "/" in resolved_id else ""
+
     if not affected:
-        return json.dumps({"node": resolved_id, "message": "No dependents found — safe to change"}, separators=(',', ':'))
+        verdict = "internal only — 0 cross-repo risk" if visibility == "internal" else "public but no dependents found"
+        return json.dumps({"node": resolved_id, "visibility": visibility, "message": verdict}, separators=(',', ':'))
 
     # Group by repo
     by_repo: dict[str, int] = {}
@@ -1095,15 +1102,131 @@ def get_blast_radius(node_id: str, max_depth: int = 4, verbose: bool = False) ->
                 "depth": info["depth"],
             })
 
+    # Determine cross-repo verdict
+    cross_repos = {r for r in by_repo if r != node_repo}
+    verdict = "cross-repo" if cross_repos else "internal only"
+
     result: dict = {
         "node": resolved_id,
+        "visibility": visibility,
+        "verdict": verdict,
         "total_affected": len(affected),
         "by_repo": by_repo,
         "by_type": by_type,
     }
+    if cross_repos:
+        result["cross_repos"] = sorted(cross_repos)
     if verbose:
         details.sort(key=lambda x: x["depth"])
         result["details"] = details
+
+    return json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+
+
+@mcp.tool()
+def get_change_impact(files: str, max_depth: int = 3) -> str:
+    """
+    Nhận danh sách file đã sửa (output của `git diff --name-only`), trả về
+    repo bị ảnh hưởng, xếp theo mức độ, kèm public/internal verdict.
+
+    Args:
+        files: Danh sách file thay đổi, mỗi dòng 1 file (relative path từ repo root)
+        max_depth: Độ sâu reverse traversal (mặc định 3)
+    """
+    _init()
+
+    # Parse file list
+    file_list = [f.strip() for f in files.strip().split("\n") if f.strip()]
+    if not file_list:
+        return json.dumps({"error": "No files provided"}, separators=(',', ':'))
+
+    # Map file → nodes
+    # Build path → nodes index
+    path_to_nodes: dict[str, list[str]] = {}
+    for nid, pinfo in _State.file_mapping.items():
+        rel = pinfo["path"] if isinstance(pinfo, dict) else pinfo
+        path_to_nodes.setdefault(rel, []).append(nid)
+
+    changed_nodes: list[str] = []
+    for f in file_list:
+        # Try direct match
+        nodes = path_to_nodes.get(f, [])
+        if not nodes:
+            # Try with khlc-* prefix (user might pass from repo root)
+            for key in path_to_nodes:
+                if key.endswith(f) or f.endswith(key.split("/", 1)[-1] if "/" in key else key):
+                    nodes.extend(path_to_nodes[key])
+                    break
+        changed_nodes.extend(nodes)
+
+    if not changed_nodes:
+        return json.dumps({
+            "changed": {"files": len(file_list), "nodes": 0},
+            "verdict": "no matching nodes in graph",
+            "hint": "Files not indexed. Use relative paths like 'khlc-cart/lib/src/...'"
+        }, separators=(',', ':'))
+
+    # Get node metadata
+    node_meta_map = {n["id"]: n for n in _State.graph.get("nodes", [])}
+
+    # Reverse traversal from changed nodes
+    all_affected: dict[str, dict] = {}
+    for start_node in changed_nodes:
+        def _reverse_dfs(node, depth, visited):
+            if depth > max_depth:
+                return
+            for (caller, etype) in _State.adj_reverse.get(node, []):
+                if etype in ("depends_on", "binds", "has_part_of", "data_flows_to",
+                             "extends", "mixes_in", "imports_from", "imports_local"):
+                    if caller not in all_affected and caller not in changed_nodes:
+                        all_affected[caller] = {"depth": depth, "via": etype, "source": start_node}
+                        if caller not in visited:
+                            visited.add(caller)
+                            _reverse_dfs(caller, depth + 1, visited)
+        _reverse_dfs(start_node, 1, {start_node})
+
+    # Determine visibility of changed nodes
+    changed_visibility = set()
+    for nid in changed_nodes:
+        meta = node_meta_map.get(nid, {})
+        changed_visibility.add(meta.get("visibility", "unknown"))
+
+    # Group affected by repo
+    impact_by_repo: dict[str, dict] = {}
+    changed_repos = set(nid.split("/")[0] for nid in changed_nodes if "/" in nid)
+    for nid, info in all_affected.items():
+        repo = nid.split("/")[0] if "/" in nid else "unknown"
+        if repo not in impact_by_repo:
+            impact_by_repo[repo] = {"dependents": 0, "public_nodes": 0, "via": set()}
+        impact_by_repo[repo]["dependents"] += 1
+        impact_by_repo[repo]["via"].add(info["via"])
+        meta = node_meta_map.get(nid, {})
+        if meta.get("visibility") == "public":
+            impact_by_repo[repo]["public_nodes"] += 1
+
+    # Build verdict
+    cross_repos = {r for r in impact_by_repo if r not in changed_repos}
+    verdict = "cross-repo" if cross_repos else "internal-only"
+
+    # Build impact list
+    impact = []
+    for repo, data in sorted(impact_by_repo.items(), key=lambda x: x[1]["dependents"], reverse=True):
+        risk = "high" if data["dependents"] > 10 else "medium" if data["dependents"] > 3 else "low"
+        impact.append({
+            "repo": repo,
+            "via": sorted(data["via"]),
+            "public_nodes": data["public_nodes"],
+            "dependents": data["dependents"],
+            "risk": risk,
+        })
+
+    result = {
+        "changed": {"files": len(file_list), "nodes": len(changed_nodes)},
+        "verdict": verdict,
+        "impact": impact,
+        "internal_only": sorted(r for r in changed_repos if r not in cross_repos),
+        "regression_suggest": sorted(cross_repos)[:5] if cross_repos else [],
+    }
 
     return json.dumps(result, ensure_ascii=False, separators=(',', ':'))
 
@@ -1745,7 +1868,8 @@ def get_repo_coupling() -> str:
             [(r, sum(d.get(r, 0) for d in repo_deps.values())) for r in all_repos],
             key=lambda x: x[1], reverse=True
         )[:5],
-    }, ensure_ascii=False, indent=2)
+        "pubspec_deps": _State.graph.get("repo_deps", {}),
+    }, ensure_ascii=False, separators=(',', ':'))
 
 
 # ─────────────────────────────────────────

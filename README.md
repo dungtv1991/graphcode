@@ -69,7 +69,7 @@ File `~/.kiro/settings/mcp.json`:
       "autoApprove": [
         "query_context", "get_file_content", "grep_in_files",
         "search_by_filename", "search_by_api_path", "search_by_error_type",
-        "list_nodes", "build_db", "get_blast_radius",
+        "list_nodes", "build_db", "get_blast_radius", "get_change_impact",
         "find_similar_modules", "detect_communities",
         "get_architecture_overview", "get_repo_coupling"
       ]

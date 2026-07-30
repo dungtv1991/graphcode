@@ -144,6 +144,10 @@ _RE_METHOD = re.compile(r'(?:Future|Stream|void|bool|String|int|double|List|Map)
 _RE_EVENT_CLASS = re.compile(r'class\s+(\w+Event)\b')
 _RE_STATE_CLASS = re.compile(r'class\s+(\w+State)\b')
 _RE_IMPORT = re.compile(r"import\s+['\"]package:(\w+)/(.+?)['\"]")
+_RE_EXPORT = re.compile(
+    r"export\s+['\"](.+?)['\"]"
+    r"(?:\s+(show|hide)\s+([\w\s,]+))?"
+)
 # Fix 1: Constructor injection — detect typed params in constructor
 _RE_CONSTRUCTOR_PARAM = re.compile(r'(?:required\s+)?(?:this\.\w+|(\w+)\s+\w+)[,\)]')
 _RE_TYPED_FIELD = re.compile(r'final\s+(\w+)[\s<]')
@@ -152,6 +156,129 @@ _RE_WITH_MIXIN = re.compile(r'\bwith\s+([\w\s,]+?)(?:\s*\{|\s*implements)')
 _RE_WITH_SIMPLE = re.compile(r'\bwith\s+([\w,\s]+)')
 # Fix 1: Direct instantiation
 _RE_INSTANTIATION = re.compile(r'(\b[A-Z]\w+)\s*\(')
+
+
+def _build_barrel_map(root_dir: str, package_repo_map: dict) -> dict[str, list[str]]:
+    """Build map: barrel_key → [rel_paths of files exported by barrel].
+
+    barrel_key = '{package}/{path}', e.g. 'khlc_core/khlc_core.dart'
+
+    Đệ quy khi export trỏ barrel khác. Tôn trọng `hide`/`show`.
+    Cache theo file để không parse lại.
+    """
+    _barrel_cache: dict[str, list[str]] = {}
+
+    def _resolve_export_path(export_uri: str, barrel_file: str, repo_name: str) -> str | None:
+        """Resolve export URI → absolute path on disk."""
+        if export_uri.startswith("package:"):
+            # export 'package:khlc_x/path.dart'
+            parts = export_uri.replace("package:", "").split("/", 1)
+            if len(parts) != 2:
+                return None
+            pkg, rel = parts
+            target_repo = package_repo_map.get(pkg)
+            if not target_repo:
+                return None  # external package (app_*, flutter, etc.)
+            return os.path.join(root_dir, target_repo, "lib", rel)
+        else:
+            # relative export: export 'src/foo.dart'
+            barrel_dir = os.path.dirname(barrel_file)
+            return os.path.normpath(os.path.join(barrel_dir, export_uri))
+
+    def _parse_barrel(file_path: str, repo_name: str, visited: set | None = None) -> list[str]:
+        """Parse 1 barrel file, trả về list relative paths (tới root_dir) mà nó export."""
+        if visited is None:
+            visited = set()
+        if file_path in visited:
+            return []  # circular export
+        visited.add(file_path)
+
+        cache_key = file_path
+        if cache_key in _barrel_cache:
+            return _barrel_cache[cache_key]
+
+        if not os.path.exists(file_path):
+            _barrel_cache[cache_key] = []
+            return []
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            _barrel_cache[cache_key] = []
+            return []
+
+        result_paths: list[str] = []
+
+        for match in _RE_EXPORT.finditer(content):
+            export_uri = match.group(1)
+            clause_type = match.group(2)  # 'show' or 'hide' or None
+            # clause_names = match.group(3)  # names (unused for path resolution)
+
+            resolved = _resolve_export_path(export_uri, file_path, repo_name)
+            if resolved is None:
+                continue  # external package — skip
+
+            if os.path.exists(resolved):
+                rel = os.path.relpath(resolved, root_dir)
+                # Check if this is itself a barrel (has exports, no class defs)
+                # Simple heuristic: if file has 'export' lines → treat as sub-barrel
+                try:
+                    with open(resolved, "r", encoding="utf-8", errors="ignore") as ef:
+                        sub_content = ef.read(2048)
+                    if "export '" in sub_content or 'export "' in sub_content:
+                        # Recursively expand sub-barrel
+                        sub_repo = rel.split("/")[0]
+                        sub_paths = _parse_barrel(resolved, sub_repo, visited.copy())
+                        result_paths.extend(sub_paths)
+                    else:
+                        result_paths.append(rel)
+                except Exception:
+                    result_paths.append(rel)
+            else:
+                # File doesn't exist — might be in external package
+                pass
+
+        _barrel_cache[cache_key] = result_paths
+        return result_paths
+
+    # Build barrel map for all khlc-* repos
+    barrel_map: dict[str, list[str]] = {}
+
+    for repo_name in os.listdir(root_dir):
+        if not repo_name.startswith("khlc-") or not os.path.isdir(os.path.join(root_dir, repo_name)):
+            continue
+        lib_dir = os.path.join(root_dir, repo_name, "lib")
+        if not os.path.exists(lib_dir):
+            continue
+
+        # Find barrel files: top-level .dart in lib/ that contain export statements
+        for fname in os.listdir(lib_dir):
+            if not fname.endswith(".dart"):
+                continue
+            barrel_path = os.path.join(lib_dir, fname)
+            try:
+                with open(barrel_path, "r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(512)
+                if "export " not in head:
+                    continue
+            except Exception:
+                continue
+
+            # Derive package name from pubspec
+            pkg_name = package_repo_map.get(repo_name) or repo_name.replace("-", "_")
+            # Reverse lookup: find pkg name that maps to this repo
+            for pkg, repo in package_repo_map.items():
+                if repo == repo_name:
+                    pkg_name = pkg
+                    break
+
+            barrel_key = f"{pkg_name}/{fname}"
+            exported_paths = _parse_barrel(barrel_path, repo_name)
+            if exported_paths:
+                barrel_map[barrel_key] = exported_paths
+
+    return barrel_map
 
 
 def _resolve_import_to_class(pkg: str, path: str, package_repo_map: dict, file_mapping: dict) -> str | None:
@@ -575,6 +702,77 @@ def _build_package_repo_map(root_dir: str) -> dict:
     return result
 
 
+def _build_repo_deps(root_dir: str, package_repo_map: dict) -> dict[str, dict[str, str]]:
+    """Parse pubspec.yaml dependencies → {repo: {dep_pkg: source}}.
+
+    source = 'path' | 'git:url#ref' | 'pub'
+    Bắt cả git deps (app_*) và path deps (khlc_*).
+    """
+    repo_deps: dict[str, dict[str, str]] = {}
+    repos = [
+        d for d in os.listdir(root_dir)
+        if d.startswith('khlc-') and os.path.isdir(os.path.join(root_dir, d))
+    ]
+    for repo_name in repos:
+        pubspec = os.path.join(root_dir, repo_name, 'pubspec.yaml')
+        if not os.path.exists(pubspec):
+            continue
+        try:
+            with open(pubspec, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        deps: dict[str, str] = {}
+        # Simple YAML parser for dependencies block
+        in_deps = False
+        in_dep_detail = ""
+        for line in content.split("\n"):
+            stripped = line.strip()
+            # Detect start of dependencies/dependency_overrides block
+            if line.startswith("dependencies:") or line.startswith("dependency_overrides:"):
+                in_deps = True
+                in_dep_detail = ""
+                continue
+            # End of block (new top-level key)
+            if in_deps and line and not line[0].isspace() and ":" in line:
+                in_deps = False
+                in_dep_detail = ""
+                continue
+            if not in_deps:
+                continue
+
+            # Parse dep entries
+            if stripped and not stripped.startswith("#"):
+                # Check if this is a dep name (2-space indent: "  dep_name:")
+                indent = len(line) - len(line.lstrip())
+                if indent == 2 and ":" in stripped:
+                    dep_name = stripped.split(":")[0].strip()
+                    rest = stripped.split(":", 1)[1].strip()
+                    in_dep_detail = dep_name
+                    if rest and rest != "":
+                        # Inline value: "dep: ^1.0.0" or "dep: path: ../x"
+                        deps[dep_name] = "pub"
+                elif indent >= 4 and in_dep_detail:
+                    # Sub-keys: git, path, url, ref
+                    if stripped.startswith("git:") or stripped.startswith("url:"):
+                        url = stripped.split(":", 1)[1].strip().strip("'\"")
+                        deps[in_dep_detail] = f"git:{url}"
+                    elif stripped.startswith("path:"):
+                        path = stripped.split(":", 1)[1].strip().strip("'\"")
+                        deps[in_dep_detail] = f"path:{path}"
+
+        # Filter to only relevant deps (khlc_*, app_*)
+        relevant_deps = {
+            k: v for k, v in deps.items()
+            if k.startswith("khlc_") or k.startswith("app_") or k in package_repo_map
+        }
+        if relevant_deps:
+            repo_deps[repo_name] = relevant_deps
+
+    return repo_deps
+
+
 class FlutterModularMultiRepoParser:
     def __init__(self, root_dir):
         self.root_dir = root_dir
@@ -605,6 +803,17 @@ class FlutterModularMultiRepoParser:
                         self.file_mapping.update(fm)
 
         # Post-process: resolve ALL imports (cross-repo + same-repo)
+        print("  -> Building barrel export map...")
+        barrel_map = _build_barrel_map(self.root_dir, package_repo_map)
+        self.barrel_map = barrel_map
+        print(f"     {len(barrel_map)} barrels mapped")
+
+        # Build reverse: rel_path → [qualified node IDs in that file]
+        path_to_nodes: dict[str, list[str]] = {}
+        for nid, pinfo in self.file_mapping.items():
+            rel = pinfo["path"] if isinstance(pinfo, dict) else pinfo
+            path_to_nodes.setdefault(rel, []).append(nid)
+
         print("  -> Resolving import edges (cross-repo + same-repo)...")
         import_edges = []
         for node_id, path_info in self.file_mapping.items():
@@ -622,6 +831,8 @@ class FlutterModularMultiRepoParser:
                 target_repo = package_repo_map.get(pkg)
                 if not target_repo:
                     continue
+
+                # Strategy 1+2: exact path / filename match
                 target_node = _resolve_import_to_class(
                     pkg, imp_path, package_repo_map, self.file_mapping
                 )
@@ -630,6 +841,19 @@ class FlutterModularMultiRepoParser:
                     import_edges.append({
                         "from": node_id, "to": target_node, "type": etype
                     })
+                    continue
+
+                # Strategy 0: barrel import — ghi nhận edge imports_from tới barrel file
+                # Không expand per class (tránh bùng nổ 4M+ edges)
+                # blast radius sẽ dùng barrel_map trực tiếp khi cần
+                barrel_key = f"{pkg}/{imp_path}"
+                if barrel_key in barrel_map and target_repo != node_repo:
+                    # Tạo 1 edge đại diện: node → barrel (gắn via=barrel)
+                    import_edges.append({
+                        "from": node_id, "to": f"{target_repo}::{barrel_key}",
+                        "type": "imports_from", "via": "barrel"
+                    })
+
         self.edges.extend(import_edges)
         print(f"     Found {len(import_edges)} import edges (cross + local)")
 
@@ -659,6 +883,12 @@ class FlutterModularMultiRepoParser:
         self.edges.extend(test_edges)
         print(f"     Found {len(test_edges)} tested_by edges")
 
+        # Post-process: pubspec dependency graph
+        print("  -> Parsing pubspec dependencies...")
+        self.repo_deps = _build_repo_deps(self.root_dir, package_repo_map)
+        total_deps = sum(len(d) for d in self.repo_deps.values())
+        print(f"     {len(self.repo_deps)} repos, {total_deps} dependencies")
+
     def save_results(self):
         # ID giờ là qualified → unique, không cần dedup
         # Nhưng vẫn dedup cho safety (nếu trùng path+class)
@@ -671,6 +901,32 @@ class FlutterModularMultiRepoParser:
         for n in unique_nodes.values():
             bare = n.get("bare_name", n["id"].rsplit("::", 1)[-1] if "::" in n["id"] else n["id"])
             alias_index.setdefault(bare, []).append(n["id"])
+
+        # Visibility marking: public = reachable từ barrel của repo mình
+        barrel_exported_paths = set()
+        for barrel_key, paths in getattr(self, "barrel_map", {}).items():
+            for p in paths:
+                barrel_exported_paths.add(p)
+        for n in unique_nodes.values():
+            nid = n["id"]
+            rel_path = self.file_mapping.get(nid, {})
+            rel = rel_path["path"] if isinstance(rel_path, dict) else rel_path if isinstance(rel_path, str) else ""
+            n["visibility"] = "public" if rel in barrel_exported_paths else "internal"
+
+        # ExternalPackage stubs — packages không có source (app_*)
+        external_pkgs = ["app_core", "app_ui", "app_interface", "app_notification",
+                         "app_settings", "app_tracking", "app_authentication", "app_badge_plus"]
+        for pkg in external_pkgs:
+            stub_id = f"{pkg}::__external__"
+            unique_nodes[stub_id] = {
+                "id": stub_id,
+                "type": "ExternalPackage",
+                "bare_name": pkg,
+                "visibility": "public",
+                "source": "git2.fptshop.com.vn",
+                "indexed": False,
+            }
+            alias_index.setdefault(pkg, []).append(stub_id)
 
         # Edge resolution: target là bare name → resolve sang qualified ID
         # Ưu tiên: cùng repo trước, rồi cross-repo
@@ -706,7 +962,10 @@ class FlutterModularMultiRepoParser:
             key = (src, tgt, e['type'])
             if key not in edge_set:
                 edge_set.add(key)
-                unique_edges.append({"from": src, "to": tgt, "type": e['type']})
+                edge_out = {"from": src, "to": tgt, "type": e['type']}
+                if e.get("via"):
+                    edge_out["via"] = e["via"]
+                unique_edges.append(edge_out)
 
         # similar_to edges
         unique_edges += self._build_similar_to_edges(unique_nodes, unique_edges)
@@ -716,6 +975,8 @@ class FlutterModularMultiRepoParser:
             "edges": unique_edges,
             "file_mapping": self.file_mapping,
             "alias_index": alias_index,
+            "barrel_map": getattr(self, "barrel_map", {}),
+            "repo_deps": getattr(self, "repo_deps", {}),
             "parser": "tree-sitter" if USE_TREESITTER else "regex",
         }
 
