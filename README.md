@@ -91,6 +91,7 @@ File `~/.kiro/settings/mcp.json`:
 | `search_by_api_path` | Tìm code xử lý API endpoint |
 | `search_by_error_type` | Tìm nơi throw/catch exception |
 | `get_blast_radius` | Phân tích ảnh hưởng khi sửa 1 class |
+| `get_change_impact` | Đánh giá impact từ `git diff --name-only` → verdict + repos bị ảnh hưởng |
 | `find_similar_modules` | Tìm module tương tự làm template |
 | `detect_communities` | Phát hiện nhóm code liên quan |
 | `get_architecture_overview` | Hub nodes, bridge nodes, coupling |
@@ -177,6 +178,8 @@ python3 -c "from mcp_server import build_db; print(build_db())"
 | `OPENAI_API_KEY` | Dùng OpenAI embeddings thay local | — |
 | `AZURE_OPENAI_ENDPOINT` | Dùng Azure OpenAI embeddings | — |
 **Ưu tiên embedding**: Azure > OpenAI > Local (SentenceTransformer)
+
+> ⚠️ **Ràng buộc**: Không đổi embedding model. Máy Intel i5-1038NG7 CPU-only, giữ `paraphrase-multilingual-MiniLM-L12-v2` (max_seq_length=128 token). Document được thiết kế vừa budget này.
 
 ---
 

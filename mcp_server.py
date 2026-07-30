@@ -1702,14 +1702,93 @@ def check_steering(project_path: str, ide: str = "kiro") -> str:
 
 
 # ─────────────────────────────────────────
-# Incremental rebuild (reusable by watch daemon)
+# Incremental graph + vector rebuild
 # ─────────────────────────────────────────
+def _incremental_graph_update(changed_files: list[str]):
+    """Re-parse changed .dart files, merge delta into knowledge_graph.json.
+
+    - Remove old nodes/edges from changed files
+    - Parse files → new nodes/edges
+    - Merge into graph, rebuild alias_index + adjacency
+    """
+    from extract_graph import parse_dart_file, _repo_from_path
+
+    if _State.graph is None:
+        return
+
+    # Determine which files actually changed (exist on disk)
+    valid_files = [f for f in changed_files if os.path.exists(f) and f.endswith('.dart')]
+    if not valid_files:
+        return
+
+    # Current graph data
+    nodes_list = _State.graph.get("nodes", [])
+    edges_list = _State.graph.get("edges", [])
+    file_mapping = _State.file_mapping
+
+    # Find nodes currently belonging to changed files
+    changed_rels = {os.path.relpath(f, FPT_ROOT) for f in valid_files}
+    old_node_ids = set()
+    for nid, pinfo in list(file_mapping.items()):
+        rel = pinfo["path"] if isinstance(pinfo, dict) else pinfo
+        if rel in changed_rels:
+            old_node_ids.add(nid)
+
+    # Remove old nodes + edges from/to old nodes
+    nodes_list = [n for n in nodes_list if n["id"] not in old_node_ids]
+    edges_list = [e for e in edges_list if e["from"] not in old_node_ids]
+    for nid in old_node_ids:
+        file_mapping.pop(nid, None)
+
+    # Re-parse each changed file
+    for abs_path in valid_files:
+        rel = os.path.relpath(abs_path, FPT_ROOT)
+        repo_name = rel.split("/")[0] if "/" in rel else ""
+        if not repo_name.startswith("khlc-"):
+            continue
+        try:
+            new_nodes, new_edges, new_fm = parse_dart_file(abs_path, repo_name, FPT_ROOT)
+            nodes_list.extend(new_nodes)
+            edges_list.extend(new_edges)
+            file_mapping.update(new_fm)
+        except Exception as e:
+            print(f"[graph-update] Error parsing {rel}: {e}", file=sys.stderr)
+
+    # Update graph state
+    _State.graph["nodes"] = nodes_list
+    _State.graph["edges"] = edges_list
+    _State.graph["file_mapping"] = file_mapping
+    _State.file_mapping = file_mapping
+    _State.edges = edges_list
+
+    # Rebuild alias_index
+    alias_index: dict[str, list[str]] = {}
+    for n in nodes_list:
+        bare = n.get("bare_name", n["id"].rsplit("::", 1)[-1] if "::" in n["id"] else n["id"])
+        alias_index.setdefault(bare, []).append(n["id"])
+    _State.graph["alias_index"] = alias_index
+
+    # Rebuild adjacency index
+    _build_adjacency_index()
+
+    # Save to disk
+    with open(GRAPH_FILE, "w", encoding="utf-8") as f:
+        json.dump(_State.graph, f, indent=2, ensure_ascii=False)
+
+    print(f"[graph-update] {len(valid_files)} files re-parsed, "
+          f"{len(nodes_list)} nodes, {len(edges_list)} edges", file=sys.stderr)
+
+
 def _incremental_rebuild(changed_files: list[str]):
     """Rebuild vector DB for specific changed files. Called by watch daemon."""
-    from extract_graph import scan_changed_only, _hash_file
+    from extract_graph import scan_changed_only, _hash_file, parse_dart_file, _make_qualified_id, _repo_from_path
 
     if _State.graph is None or _State.model is None:
         _init()
+
+    # ── Step 0: Graph incremental update ──
+    # Re-parse changed files, merge delta nodes/edges into graph
+    _incremental_graph_update(changed_files)
 
     # Load hash store
     if os.path.exists(HASH_STORE_FILE):
